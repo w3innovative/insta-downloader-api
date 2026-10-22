@@ -5,6 +5,13 @@ import subprocess
 import os
 
 class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps({'status': 'API is live and running'}).encode('utf-8'))
+
     def do_POST(self):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
@@ -22,7 +29,6 @@ class handler(BaseHTTPRequestHandler):
 
             clean_url = url.split('?')[0]
 
-            # Execute yt-dlp via python
             import yt_dlp
             ydl_opts = {'format': 'best'}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
