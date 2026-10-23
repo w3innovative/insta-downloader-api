@@ -1,11 +1,50 @@
 from http.server import BaseHTTPRequestHandler
 import json
 import urllib.parse
-import subprocess
-import os
+import urllib.request
+import yt_dlp
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        query_path = self.path
+        if '?url=' in query_path:
+            # Handle direct proxy download stream
+            try:
+                parsed_url = urllib.parse.urlparse(query_path)
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+                target_url = query_params.get('url', [None])[0]
+                filename = query_params.get('filename', ['instagram-video.mp4'])[0]
+
+                if not target_url:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
+                # Stream video from Instagram CDN through our Vercel API with attachment headers
+                req = urllib.request.Request(
+                    target_url,
+                    headers={'User-Agent': 'Mozilla/5.0'}
+                )
+                with urllib.request.urlopen(req) as remote_file:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'video/mp4')
+                    self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    
+                    while True:
+                        chunk = remote_file.read(8192)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': str(e)}).encode('utf-8'))
+                return
+
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -29,7 +68,6 @@ class handler(BaseHTTPRequestHandler):
 
             clean_url = url.split('?')[0]
 
-            import yt_dlp
             ydl_opts = {'format': 'best'}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(clean_url, download=False)
@@ -58,6 +96,6 @@ class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
