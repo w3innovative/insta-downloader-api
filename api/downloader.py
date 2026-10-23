@@ -19,7 +19,6 @@ class handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
 
-                # Stream file from Instagram CDN with download disposition header
                 req = urllib.request.Request(
                     target_url,
                     headers={'User-Agent': 'Mozilla/5.0'}
@@ -68,41 +67,44 @@ class handler(BaseHTTPRequestHandler):
 
             clean_url = url.split('?')[0]
 
-            # Try video format first, fallback to standard info extraction for images
-            ydl_opts = {
-                'format': 'best',
-                'quiet': True,
-                'no_warnings': True
-            }
-            
             media_url = None
             is_image = False
+
+            # Universal extraction options that handle both videos and photos cleanly
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False
+            }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
-                        # Check video stream first
+                        # 1. Check if direct video URL exists
                         media_url = info.get('url')
                         
-                        # Fallback for static image posts
-                        if not media_url and 'thumbnails' in info and len(info['thumbnails']) > 0:
-                            # Grab highest resolution thumbnail available
-                            media_url = info['thumbnails'][-1].get('url')
-                            is_image = True
-                        elif not media_url and info.get('thumbnail'):
-                            media_url = info.get('thumbnail')
-                            is_image = True
-                except Exception as ex:
-                    # Retry with generic info extraction if video extraction fails
-                    ydl_opts_gen = {'quiet': True, 'skip_download': True}
-                    with yt_dlp.YoutubeDL(ydl_opts_gen) as ydl_gen:
-                        info = ydl_gen.extract_info(clean_url, download=False)
-                        if info:
-                            media_url = info.get('thumbnail') or (info.get('thumbnails', [{}])[-1].get('url') if info.get('thumbnails') else None)
-                            is_image = True
+                        # 2. If it's a playlist/carousel or has entries, grab first item
+                        if not media_url and 'entries' in info and len(info['entries']) > 0:
+                            first_entry = info['entries'][0]
+                            media_url = first_entry.get('url') or first_entry.get('thumbnail')
 
+                        # 3. If still no media_url or if it's a static post, extract high-res thumbnail/image
+                        if not media_url or 'ext' in info and info.get('ext') not in ['mp4', 'webm', 'm4v']:
+                            if 'thumbnails' in info and len(info['thumbnails']) > 0:
+                                media_url = info['thumbnails'][-1].get('url')
+                                is_image = True
+                            elif info.get('thumbnail'):
+                                media_url = info.get('thumbnail')
+                                is_image = True
+                except Exception as ex:
+                    pass
+
+            # Final check: if the URL points directly to an image or video asset
             if media_url:
+                if any(ext in media_url.lower() for ext in ['.jpg', '.jpeg', '.webp', '.png']):
+                    is_image = True
+
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -113,7 +115,7 @@ class handler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps({'error': 'Could not extract media stream or image'}).encode('utf-8'))
+                self.wfile.write(json.dumps({'error': 'Could not extract media. Please check if the post is public.'}).encode('utf-8'))
 
         except Exception as e:
             self.send_response(500)
