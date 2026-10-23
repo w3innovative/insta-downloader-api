@@ -2,6 +2,7 @@ from http.server import BaseHTTPRequestHandler
 import json
 import urllib.parse
 import urllib.request
+import re
 import yt_dlp
 
 class handler(BaseHTTPRequestHandler):
@@ -21,7 +22,7 @@ class handler(BaseHTTPRequestHandler):
 
                 req = urllib.request.Request(
                     target_url,
-                    headers={'User-Agent': 'Mozilla/5.0'}
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 )
                 with urllib.request.urlopen(req) as remote_file:
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
@@ -55,9 +56,9 @@ class handler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode('utf-8')
             data = json.loads(body)
-            url = data.get('url', '')
+            raw_url = data.get('url', '')
 
-            if not url or 'instagram.com' not in url:
+            if not raw_url or 'instagram.com' not in raw_url:
                 self.send_response(400)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -65,44 +66,61 @@ class handler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({'error': 'Invalid Instagram URL'}).encode('utf-8'))
                 return
 
-            clean_url = url.split('?')[0]
+            # Clean URL: strip parameters and normalize username-based post URLs
+            clean_url = raw_url.split('?')[0]
+            
+            # Convert https://instagram.com/username/p/code/ -> https://instagram.com/p/code/
+            match_post = re.search(r'instagram\.com/(?:[\w\.\-]+/)?(p|reel|reels|tv)/([\w\-]+)', clean_url)
+            if match_post:
+                media_type = match_post.group(1)
+                code = match_post.group(2)
+                if media_type in ['reel', 'reels']:
+                    clean_url = f'https://www.instagram.com/reel/{code}/'
+                else:
+                    clean_url = f'https://www.instagram.com/p/{code}/'
 
             media_url = None
             is_image = False
 
-            # Universal extraction options that handle both videos and photos cleanly
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'extract_flat': False
+                'skip_download': True,
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
-                        # 1. Check if direct video URL exists
+                        # 1. Direct Video Stream Check
                         media_url = info.get('url')
                         
-                        # 2. If it's a playlist/carousel or has entries, grab first item
+                        # 2. Carousel / Multi-item Check
                         if not media_url and 'entries' in info and len(info['entries']) > 0:
                             first_entry = info['entries'][0]
                             media_url = first_entry.get('url') or first_entry.get('thumbnail')
+                            if not first_entry.get('url'):
+                                is_image = True
 
-                        # 3. If still no media_url or if it's a static post, extract high-res thumbnail/image
-                        if not media_url or 'ext' in info and info.get('ext') not in ['mp4', 'webm', 'm4v']:
+                        # 3. High-res Photo / Thumbnail Fallback
+                        if not media_url:
                             if 'thumbnails' in info and len(info['thumbnails']) > 0:
                                 media_url = info['thumbnails'][-1].get('url')
                                 is_image = True
                             elif info.get('thumbnail'):
                                 media_url = info.get('thumbnail')
                                 is_image = True
+
+                        # Check extension format
+                        ext = info.get('ext', '')
+                        if ext in ['jpg', 'png', 'webp', 'heic']:
+                            is_image = True
+
                 except Exception as ex:
                     pass
 
-            # Final check: if the URL points directly to an image or video asset
             if media_url:
-                if any(ext in media_url.lower() for ext in ['.jpg', '.jpeg', '.webp', '.png']):
+                if any(img_ext in media_url.lower() for img_ext in ['.jpg', '.jpeg', '.webp', '.png']):
                     is_image = True
 
                 self.send_response(200)
