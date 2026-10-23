@@ -22,7 +22,7 @@ class handler(BaseHTTPRequestHandler):
 
                 req = urllib.request.Request(
                     target_url,
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
                 )
                 with urllib.request.urlopen(req) as remote_file:
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
@@ -66,10 +66,7 @@ class handler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({'error': 'Invalid Instagram URL'}).encode('utf-8'))
                 return
 
-            # Clean URL: strip parameters and normalize username-based post URLs
             clean_url = raw_url.split('?')[0]
-            
-            # Convert https://instagram.com/username/p/code/ -> https://instagram.com/p/code/
             match_post = re.search(r'instagram\.com/(?:[\w\.\-]+/)?(p|reel|reels|tv)/([\w\-]+)', clean_url)
             if match_post:
                 media_type = match_post.group(1)
@@ -82,6 +79,7 @@ class handler(BaseHTTPRequestHandler):
             media_url = None
             is_image = False
 
+            # 1. Try yt-dlp extraction first
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
@@ -92,17 +90,10 @@ class handler(BaseHTTPRequestHandler):
                 try:
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
-                        # 1. Direct Video Stream Check
                         media_url = info.get('url')
-                        
-                        # 2. Carousel / Multi-item Check
                         if not media_url and 'entries' in info and len(info['entries']) > 0:
                             first_entry = info['entries'][0]
                             media_url = first_entry.get('url') or first_entry.get('thumbnail')
-                            if not first_entry.get('url'):
-                                is_image = True
-
-                        # 3. High-res Photo / Thumbnail Fallback
                         if not media_url:
                             if 'thumbnails' in info and len(info['thumbnails']) > 0:
                                 media_url = info['thumbnails'][-1].get('url')
@@ -110,13 +101,26 @@ class handler(BaseHTTPRequestHandler):
                             elif info.get('thumbnail'):
                                 media_url = info.get('thumbnail')
                                 is_image = True
-
-                        # Check extension format
-                        ext = info.get('ext', '')
-                        if ext in ['jpg', 'png', 'webp', 'heic']:
+                        if info.get('ext') in ['jpg', 'png', 'webp', 'heic']:
                             is_image = True
-
                 except Exception as ex:
+                    pass
+
+            # 2. Direct Open Graph Meta Fallback for static image posts
+            if not media_url:
+                try:
+                    req = urllib.request.Request(
+                        clean_url,
+                        headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'}
+                    )
+                    with urllib.request.urlopen(req) as resp:
+                        html_content = resp.read().decode('utf-8', errors='ignore')
+                        # Extract og:image
+                        og_image_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
+                        if og_image_match:
+                            media_url = og_image_match.group(1).replace('&amp;', '&')
+                            is_image = True
+                except Exception as fallback_ex:
                     pass
 
             if media_url:
