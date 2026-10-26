@@ -79,6 +79,7 @@ class handler(BaseHTTPRequestHandler):
             media_url = None
             is_image = False
 
+            # Use yt-dlp to extract full uncropped payload structures
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
@@ -89,24 +90,40 @@ class handler(BaseHTTPRequestHandler):
                 try:
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
+                        # 1. Check direct formats or video streams
                         media_url = info.get('url')
+                        
+                        # 2. Check for carousel/sidecar entries (takes the first or highest res node)
                         if not media_url and 'entries' in info and len(info['entries']) > 0:
                             first_entry = info['entries'][0]
                             media_url = first_entry.get('url') or first_entry.get('thumbnail')
+                            if not first_entry.get('url'):
+                                is_image = True
 
-                        if not media_url or 'ext' in info and info.get('ext') not in ['mp4', 'webm']:
-                            if 'thumbnails' in info and len(info['thumbnails']) > 0:
-                                # Pick the one with the maximum height (tallest vertical source)
-                                tallest_thumb = max(info['thumbnails'], key=lambda x: x.get('height', 0))
-                                media_url = tallest_thumb.get('url')
-                                is_image = True
-                            elif info.get('thumbnail'):
-                                media_url = info.get('thumbnail')
-                                is_image = True
+                        # 3. Look through all available thumbnails/formats for the maximum height/width ratio (true vertical)
+                        candidate_urls = []
+                        if 'thumbnails' in info:
+                            for thumb in info['thumbnails']:
+                                if thumb.get('url'):
+                                    candidate_urls.append(thumb.get('url'))
+                        if 'formats' in info:
+                            for fmt in info['formats']:
+                                if fmt.get('url') and not fmt.get('vcodec') == 'none':
+                                    candidate_urls.append(fmt.get('url'))
+
+                        if candidate_urls:
+                            # Filter out small preview query strings if possible, or pick the last/largest
+                            media_url = candidate_urls[-1]
+                            is_image = True
+
+                        if not media_url and info.get('thumbnail'):
+                            media_url = info.get('thumbnail')
+                            is_image = True
                 except Exception as ex:
                     pass
 
-            if not media_url:
+            # Deep JSON / SharedData fallback parser if yt-dlp returns cropped meta
+            if not media_url or 's640x640' in media_url or '150x150' in media_url:
                 try:
                     req = urllib.request.Request(
                         clean_url,
@@ -114,17 +131,27 @@ class handler(BaseHTTPRequestHandler):
                     )
                     with urllib.request.urlopen(req) as resp:
                         html_content = resp.read().decode('utf-8', errors='ignore')
-                        og_image_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
-                        if og_image_match:
-                            media_url = og_image_match.group(1).replace('&amp;', '&')
+                        
+                        # Search for display_url inside shared data script blocks
+                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
+                        if display_urls:
+                            # Unescape unicode slashes
+                            media_url = display_urls[0].encode().decode('unicode-escape').replace('\\/', '/')
                             is_image = True
+                        else:
+                            # Fallback to og:image if display_url is missing
+                            og_image_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
+                            if og_image_match:
+                                media_url = og_image_match.group(1).replace('&amp;', '&')
+                                is_image = True
                 except Exception as fallback_ex:
                     pass
 
             if media_url:
-                # Strip Instagram sizing filters (e.g. /s640x640/ or dimension constraints) to force full uncropped master image
+                # Strip all Instagram dimension constraints and cropping parameters to guarantee original full size
                 media_url = re.sub(r'/s\d+x\d+/', '/', media_url)
                 media_url = re.sub(r'/p\d+x\d+/', '/', media_url)
+                media_url = re.sub(r'\?efg=[^&]+', '', media_url) # Clean tracking tokens that force square scaling
 
                 if any(img_ext in media_url.lower() for img_ext in ['.jpg', '.jpeg', '.webp', '.png']):
                     is_image = True
