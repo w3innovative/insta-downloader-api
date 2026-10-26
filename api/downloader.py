@@ -79,7 +79,6 @@ class handler(BaseHTTPRequestHandler):
             media_url = None
             is_image = False
 
-            # 1. Try yt-dlp extraction first
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
@@ -90,23 +89,32 @@ class handler(BaseHTTPRequestHandler):
                 try:
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
+                        # Check direct video stream
                         media_url = info.get('url')
+                        
+                        # Check requested formats or direct image resources
+                        if not media_url and 'formats' in info and len(info['formats']) > 0:
+                            media_url = info['formats'][-1].get('url')
+
+                        # Check carousel entries for full-size images
                         if not media_url and 'entries' in info and len(info['entries']) > 0:
                             first_entry = info['entries'][0]
                             media_url = first_entry.get('url') or first_entry.get('thumbnail')
-                        if not media_url:
+
+                        # Extract highest resolution original image from formats/thumbnails list if available
+                        if not media_url or 'ext' in info and info.get('ext') not in ['mp4', 'webm']:
                             if 'thumbnails' in info and len(info['thumbnails']) > 0:
-                                media_url = info['thumbnails'][-1].get('url')
+                                # Sort by resolution width/height to get the tallest/largest uncropped image
+                                sorted_thumbs = sorted(info['thumbnails'], key=lambda x: x.get('width', 0) * x.get('height', 0), reverse=True)
+                                media_url = sorted_thumbs[0].get('url')
                                 is_image = True
                             elif info.get('thumbnail'):
                                 media_url = info.get('thumbnail')
                                 is_image = True
-                        if info.get('ext') in ['jpg', 'png', 'webp', 'heic']:
-                            is_image = True
                 except Exception as ex:
                     pass
 
-            # 2. Direct Open Graph Meta Fallback for static image posts
+            # Fallback to Open Graph if yt-dlp couldn't resolve
             if not media_url:
                 try:
                     req = urllib.request.Request(
@@ -115,7 +123,6 @@ class handler(BaseHTTPRequestHandler):
                     )
                     with urllib.request.urlopen(req) as resp:
                         html_content = resp.read().decode('utf-8', errors='ignore')
-                        # Extract og:image
                         og_image_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
                         if og_image_match:
                             media_url = og_image_match.group(1).replace('&amp;', '&')
