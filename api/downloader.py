@@ -3,6 +3,7 @@ import json
 import urllib.parse
 import urllib.request
 import re
+import yt_dlp
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -68,91 +69,95 @@ class handler(BaseHTTPRequestHandler):
             clean_url = raw_url.split('?')[0]
             match_post = re.search(r'instagram\.com/(?:[\w\.\-]+/)?(p|reel|reels|tv)/([\w\-]+)', clean_url)
             if match_post:
+                media_type = match_post.group(1)
                 code = match_post.group(2)
-                embed_url = f'https://www.instagram.com/p/{code}/embed/captioned/'
-            else:
-                embed_url = clean_url
+                if media_type in ['reel', 'reels']:
+                    clean_url = f'https://www.instagram.com/reel/{code}/'
+                else:
+                    clean_url = f'https://www.instagram.com/p/{code}/'
 
             media_urls = []
             is_image = True
 
-            # 1. Try public embed endpoint
-            try:
-                req = urllib.request.Request(
-                    embed_url,
-                    headers={
-                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.5'
-                    }
-                )
-                with urllib.request.urlopen(req) as resp:
-                    html_content = resp.read().decode('utf-8', errors='ignore')
+            # 1. Primary Extraction using yt-dlp (handles carousels & reels reliably)
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+            }
 
-                    # Check video streams first if reel/video
-                    video_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
-                    if video_matches:
-                        vid_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '/').replace('&amp;', '&')
-                        media_urls.append(vid_url)
-                        is_image = False
-                    else:
-                        # Extract carousel slide images or single post images from embed HTML
-                        matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
-                        for m in matches:
-                            decoded = m.encode().decode('unicode-escape').replace('&amp;', '&')
-                            decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
-                            decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
-                            decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
-                            if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
-                                media_urls.append(decoded)
-            except Exception as ex:
-                pass
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                try:
+                    info = ydl.extract_info(clean_url, download=False)
+                    if info:
+                        # Check if it's a video/reel
+                        if info.get('ext') in ['mp4', 'webm'] or info.get('vcodec') != 'none':
+                            vid_url = info.get('url')
+                            if vid_url:
+                                media_urls.append(vid_url)
+                                is_image = False
 
-            # 2. Fallback to direct page scraping if embed didn't yield media
+                        # Check for carousel sidecar entries
+                        if 'entries' in info:
+                            for entry in info['entries']:
+                                node_url = entry.get('url') or entry.get('thumbnail')
+                                if node_url and node_url not in media_urls:
+                                    media_urls.append(node_url)
+
+                        # If single item or no entries populated
+                        if not media_urls:
+                            if info.get('url'):
+                                media_urls.append(info.get('url'))
+                            elif info.get('thumbnail'):
+                                media_urls.append(info.get('thumbnail'))
+                except Exception as ydl_ex:
+                    pass
+
+            # 2. Fallback Extraction via public JSON graph / shared data scraping
             if not media_urls:
                 try:
-                    req_post = urllib.request.Request(
+                    req = urllib.request.Request(
                         clean_url,
                         headers={
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.5'
                         }
                     )
-                    with urllib.request.urlopen(req_post) as resp_post:
-                        html_post = resp_post.read().decode('utf-8', errors='ignore')
-
-                        # Check for video in direct page
-                        vid_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_post)
-                        if vid_matches:
-                            vid_url = vid_matches[0].encode().decode('unicode-escape').replace('\\/', '/')
-                            media_urls.append(vid_url)
-                            is_image = False
-                        else:
-                            display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_post)
-                            if display_urls:
-                                for u in display_urls:
-                                    decoded = u.encode().decode('unicode-escape').replace('\\/', '/')
-                                    decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
-                                    decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
-                                    decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
-                                    if decoded not in media_urls:
-                                        media_urls.append(decoded)
-                            
-                            if not media_urls:
-                                og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_post)
-                                if og_match:
-                                    og_url = og_match.group(1).replace('&amp;', '&')
-                                    og_url = re.sub(r'/s\d+x\d+/', '/', og_url)
-                                    media_urls.append(og_url)
-                except Exception as e2:
+                    with urllib.request.urlopen(req) as resp:
+                        html_content = resp.read().decode('utf-8', errors='ignore')
+                        
+                        # Search for all display_url entries in JSON nodes
+                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
+                        if display_urls:
+                            for u in display_urls:
+                                decoded = u.encode().decode('unicode-escape').replace('\\/', '/')
+                                if decoded not in media_urls:
+                                    media_urls.append(decoded)
+                        
+                        # Fallback to og:image if display_urls empty
+                        if not media_urls:
+                            og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
+                            if og_match:
+                                media_urls.append(og_match.group(1).replace('&amp;', '&'))
+                except Exception as fallback_ex:
                     pass
 
             if media_urls:
+                cleaned_urls = []
+                for url in media_urls:
+                    # Clean up dimensions to ensure full uncropped master size
+                    clean_img = re.sub(r'/s\d+x\d+/', '/', url)
+                    clean_img = re.sub(r'/p\d+x\d+/', '/', clean_img)
+                    clean_img = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', clean_img)
+                    if clean_img not in cleaned_urls:
+                        cleaned_urls.append(clean_img)
+
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps({'download_urls': media_urls, 'is_image': is_image}).encode('utf-8'))
+                self.wfile.write(json.dumps({'download_urls': cleaned_urls, 'is_image': is_image}).encode('utf-8'))
             else:
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
