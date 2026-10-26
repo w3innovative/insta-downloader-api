@@ -3,7 +3,6 @@ import json
 import urllib.parse
 import urllib.request
 import re
-import yt_dlp
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -22,7 +21,7 @@ class handler(BaseHTTPRequestHandler):
 
                 req = urllib.request.Request(
                     target_url,
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'}
                 )
                 with urllib.request.urlopen(req) as remote_file:
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
@@ -79,41 +78,47 @@ class handler(BaseHTTPRequestHandler):
             media_url = None
             is_image = False
 
-            # Use yt-dlp with optimized client parameters
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-                'extractor_args': {'instagram': {'max_comments': [0]}}
-            }
+            # Request Instagram page using mobile user-agent headers to extract video or master photo nodes
+            try:
+                req = urllib.request.Request(
+                    clean_url,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5'
+                    }
+                )
+                with urllib.request.urlopen(req) as resp:
+                    html_content = resp.read().decode('utf-8', errors='ignore')
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                try:
-                    info = ydl.extract_info(clean_url, download=False)
-                    if info:
-                        media_url = info.get('url')
-                        
-                        if not media_url and 'entries' in info and len(info['entries']) > 0:
-                            first_entry = info['entries'][0]
-                            media_url = first_entry.get('url') or first_entry.get('thumbnail')
+                    # 1. Search for video stream if it's a reel/video post
+                    video_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
+                    if not video_matches:
+                        video_matches = re.findall(r'property="og:video"\s+content="([^"]+)"', html_content)
 
-                        if not media_url and 'thumbnails' in info and len(info['thumbnails']) > 0:
-                            tallest = max(info['thumbnails'], key=lambda x: x.get('height', 0))
-                            media_url = tallest.get('url')
+                    if video_matches and ('reel' in clean_url or 'video' in html_content):
+                        media_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '/')
+                        is_image = False
+                    else:
+                        # 2. Search for full-size display_url image nodes
+                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
+                        if display_urls:
+                            media_url = display_urls[0].encode().decode('unicode-escape').replace('\\/', '/')
                             is_image = True
-                        elif info.get('thumbnail'):
-                            media_url = info.get('thumbnail')
-                            is_image = True
-
-                        if info.get('ext') in ['jpg', 'png', 'webp', 'heic']:
-                            is_image = True
-                except Exception as ex:
-                    pass
+                        else:
+                            # 3. Fallback to Open Graph meta tag
+                            og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
+                            if og_match:
+                                media_url = og_match.group(1).replace('&amp;', '&')
+                                is_image = True
+            except Exception as ex:
+                pass
 
             if media_url:
-                # Clean up any downscaling parameters to ensure highest available fidelity
+                # Remove Instagram square downscaling query boxes to preserve full vertical resolution
                 media_url = re.sub(r'/s\d+x\d+/', '/', media_url)
                 media_url = re.sub(r'/p\d+x\d+/', '/', media_url)
+                media_url = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', media_url)
 
                 if any(img_ext in media_url.lower() for img_ext in ['.jpg', '.jpeg', '.webp', '.png']):
                     is_image = True
