@@ -3,7 +3,6 @@ import json
 import urllib.parse
 import urllib.request
 import re
-import yt_dlp
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -73,57 +72,79 @@ class handler(BaseHTTPRequestHandler):
                 code = match_post.group(2)
                 if media_type in ['reel', 'reels']:
                     clean_url = f'https://www.instagram.com/reel/{code}/'
+                    api_endpoint = f'https://www.instagram.com/p/{code}/embed/captioned/'
                 else:
                     clean_url = f'https://www.instagram.com/p/{code}/'
+                    api_endpoint = f'https://www.instagram.com/p/{code}/embed/captioned/'
+            else:
+                api_endpoint = clean_url
 
             media_urls = []
             is_image = True
 
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-                'extractor_args': {'instagram': {'max_comments': [0]}}
-            }
+            # Use Instagram's lightweight embed/shared-data query
+            try:
+                req = urllib.request.Request(
+                    api_endpoint,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5'
+                    }
+                )
+                with urllib.request.urlopen(req) as resp:
+                    html_content = resp.read().decode('utf-8', errors='ignore')
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # Check for video streams first
+                    vid_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
+                    if not vid_matches:
+                        vid_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
+
+                    if vid_matches:
+                        vid_url = vid_matches[0].encode().decode('unicode-escape').replace('\\/', '/').replace('&amp;', '&')
+                        media_urls.append(vid_url)
+                        is_image = False
+                    else:
+                        # Grab all carousel or single image CDN elements from the page markup
+                        matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
+                        for m in matches:
+                            decoded = m.encode().decode('unicode-escape').replace('&amp;', '&')
+                            # Strip out square cropping and resizing query constraints
+                            decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
+                            decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
+                            decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
+                            if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
+                                media_urls.append(decoded)
+            except Exception as ex:
+                pass
+
+            # Fallback to direct page scraping if embed didn't return media
+            if not media_urls:
                 try:
-                    info = ydl.extract_info(clean_url, download=False)
-                    if info:
-                        if info.get('ext') in ['mp4', 'webm'] or info.get('vcodec') != 'none':
-                            vid_url = info.get('url')
-                            if vid_url:
-                                media_urls.append(vid_url)
-                                is_image = False
-
-                        if 'entries' in info:
-                            for entry in info['entries']:
-                                node_url = entry.get('url') or entry.get('thumbnail')
-                                if node_url and node_url not in media_urls:
-                                    media_urls.append(node_url)
-
-                        if not media_urls:
-                            if info.get('url'):
-                                media_urls.append(info.get('url'))
-                            elif info.get('thumbnail'):
-                                media_urls.append(info.get('thumbnail'))
-                except Exception as ydl_ex:
+                    req_direct = urllib.request.Request(
+                        clean_url,
+                        headers={
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,xhtml+xml'
+                        }
+                    )
+                    with urllib.request.urlopen(req_direct) as resp_direct:
+                        html_direct = resp_direct.read().decode('utf-8', errors='ignore')
+                        og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_direct)
+                        if og_match:
+                            og_url = og_match.group(1).replace('&amp;', '&')
+                            og_url = re.sub(r'/s\d+x\d+/', '/', og_url)
+                            og_url = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', og_url)
+                            media_urls.append(og_url)
+                except Exception as ex2:
                     pass
 
             if media_urls:
-                cleaned_urls = []
-                for url in media_urls:
-                    clean_img = re.sub(r'/s\d+x\d+/', '/', url)
-                    clean_img = re.sub(r'/p\d+x\d+/', '/', clean_img)
-                    clean_img = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', clean_img)
-                    if clean_img not in cleaned_urls:
-                        cleaned_urls.append(clean_img)
-
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps({'download_urls': cleaned_urls, 'is_image': is_image}).encode('utf-8'))
+                self.wfile.write(json.dumps({'download_urls': media_urls, 'is_image': is_image}).encode('utf-8'))
             else:
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
