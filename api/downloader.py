@@ -70,13 +70,12 @@ class handler(BaseHTTPRequestHandler):
             if match_post:
                 media_type = match_post.group(1)
                 code = match_post.group(2)
-                # Use Instagram's public embed endpoint which never blocks public posts
                 embed_url = f'https://www.instagram.com/p/{code}/embed/captioned/'
             else:
                 embed_url = clean_url
 
-            media_url = None
-            is_image = False
+            media_urls = []
+            is_image = True
 
             try:
                 req = urllib.request.Request(
@@ -90,46 +89,53 @@ class handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req) as resp:
                     html_content = resp.read().decode('utf-8', errors='ignore')
 
-                    # 1. Check for video stream in embed
+                    # 1. Check for video stream
                     video_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
                     if not video_matches:
                         video_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
 
-                    if video_matches and 'mp4' in video_matches[0]:
-                        media_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '&amp;').replace('&amp;', '&')
+                    if video_matches and ('reel' in clean_url or 'video' in html_content):
+                        vid_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '/').replace('&amp;', '&')
+                        media_urls.append(vid_url)
                         is_image = False
                     else:
-                        # 2. Extract high-res image source from public embed HTML
-                        img_matches = re.findall(r'class="EmbeddedMediaImage"[^>]+src="([^"]+)"', html_content)
-                        if not img_matches:
+                        # 2. Extract ALL display_url nodes for carousels / single photos
+                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
+                        if display_urls:
+                            for u in display_urls:
+                                decoded = u.encode().decode('unicode-escape').replace('\\/', '/')
+                                # Strip cropping parameters
+                                decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
+                                decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
+                                decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
+                                if decoded not in media_urls:
+                                    media_urls.append(decoded)
+                        
+                        # 3. Fallback to image matches or Open Graph if no display_url found
+                        if not media_urls:
                             img_matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
+                            for u in img_matches:
+                                decoded = u.encode().decode('unicode-escape').replace('&amp;', '&')
+                                decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
+                                decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
+                                if decoded not in media_urls:
+                                    media_urls.append(decoded)
 
-                        if img_matches:
-                            media_url = img_matches[0].encode().decode('unicode-escape').replace('&amp;', '&')
-                            is_image = True
-                        else:
-                            # 3. Fallback to Open Graph
+                        if not media_urls:
                             og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
                             if og_match:
-                                media_url = og_match.group(1).replace('&amp;', '&')
-                                is_image = True
+                                og_url = og_match.group(1).replace('&amp;', '&')
+                                og_url = re.sub(r'/s\d+x\d+/', '/', og_url)
+                                media_urls.append(og_url)
             except Exception as ex:
                 pass
 
-            if media_url:
-                # Strip downscaling to pull max resolution available
-                media_url = re.sub(r'/s\d+x\d+/', '/', media_url)
-                media_url = re.sub(r'/p\d+x\d+/', '/', media_url)
-                media_url = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', media_url)
-
-                if any(img_ext in media_url.lower() for img_ext in ['.jpg', '.jpeg', '.webp', '.png']):
-                    is_image = True
-
+            if media_urls:
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps({'download_url': media_url, 'is_image': is_image}).encode('utf-8'))
+                self.wfile.write(json.dumps({'download_urls': media_urls, 'is_image': is_image}).encode('utf-8'))
             else:
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
