@@ -79,7 +79,7 @@ class handler(BaseHTTPRequestHandler):
             media_urls = []
             is_image = True
 
-            # 1. Primary Extraction using yt-dlp (handles carousels & reels reliably)
+            # 1. Try yt-dlp first
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
@@ -90,21 +90,18 @@ class handler(BaseHTTPRequestHandler):
                 try:
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
-                        # Check if it's a video/reel
                         if info.get('ext') in ['mp4', 'webm'] or info.get('vcodec') != 'none':
                             vid_url = info.get('url')
                             if vid_url:
                                 media_urls.append(vid_url)
                                 is_image = False
 
-                        # Check for carousel sidecar entries
                         if 'entries' in info:
                             for entry in info['entries']:
                                 node_url = entry.get('url') or entry.get('thumbnail')
                                 if node_url and node_url not in media_urls:
                                     media_urls.append(node_url)
 
-                        # If single item or no entries populated
                         if not media_urls:
                             if info.get('url'):
                                 media_urls.append(info.get('url'))
@@ -113,13 +110,13 @@ class handler(BaseHTTPRequestHandler):
                 except Exception as ydl_ex:
                     pass
 
-            # 2. Fallback Extraction via public JSON graph / shared data scraping
+            # 2. Universal Permissive Fallback Scraper (Captures any fbcdn.net media link from page HTML)
             if not media_urls:
                 try:
                     req = urllib.request.Request(
                         clean_url,
                         headers={
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
                             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                             'Accept-Language': 'en-US,en;q=0.5'
                         }
@@ -127,15 +124,25 @@ class handler(BaseHTTPRequestHandler):
                     with urllib.request.urlopen(req) as resp:
                         html_content = resp.read().decode('utf-8', errors='ignore')
                         
-                        # Search for all display_url entries in JSON nodes
-                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
-                        if display_urls:
-                            for u in display_urls:
-                                decoded = u.encode().decode('unicode-escape').replace('\\/', '/')
-                                if decoded not in media_urls:
-                                    media_urls.append(decoded)
-                        
-                        # Fallback to og:image if display_urls empty
+                        # Check for video streams
+                        vid_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
+                        if vid_matches:
+                            media_urls.append(vid_matches[0].encode().decode('unicode-escape').replace('\\/', '/'))
+                            is_image = False
+                        else:
+                            # Capture all high-res image CDN links in the page payload
+                            raw_links = re.findall(r'https?://[^\s<>"]+fbcdn\.net[^\s<>"]+', html_content)
+                            for link in raw_links:
+                                clean_link = link.encode().decode('unicode-escape').replace('\\/', '').replace('&amp;', '&')
+                                # Filter out small UI thumbnails and profile avatars
+                                if any(ext in clean_link.lower() for ext in ['.jpg', '.jpeg', '.webp']) \
+                                   and 's150x150' not in clean_link \
+                                   and 's320x320' not in clean_link \
+                                   and 'p150x150' not in clean_link \
+                                   and clean_link not in media_urls:
+                                    media_urls.append(clean_link)
+
+                        # Ultimate fallback to og:image if list is still empty
                         if not media_urls:
                             og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
                             if og_match:
