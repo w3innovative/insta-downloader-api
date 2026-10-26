@@ -76,8 +76,8 @@ class handler(BaseHTTPRequestHandler):
             media_urls = []
             is_image = True
 
+            # 1. Try public embed endpoint
             try:
-                # Try fetching via public embed endpoint first
                 req = urllib.request.Request(
                     embed_url,
                     headers={
@@ -89,20 +89,26 @@ class handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req) as resp:
                     html_content = resp.read().decode('utf-8', errors='ignore')
 
-                    # Extract all fbcdn image links from the embed page
-                    matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
-                    for m in matches:
-                        decoded = m.encode().decode('unicode-escape').replace('&amp;', '&')
-                        decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
-                        decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
-                        decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
-                        # Filter out profile icons or tiny UI avatars
-                        if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
-                            media_urls.append(decoded)
+                    # Check video streams first if reel/video
+                    video_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
+                    if video_matches:
+                        vid_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '/').replace('&amp;', '&')
+                        media_urls.append(vid_url)
+                        is_image = False
+                    else:
+                        # Extract carousel slide images or single post images from embed HTML
+                        matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
+                        for m in matches:
+                            decoded = m.encode().decode('unicode-escape').replace('&amp;', '&')
+                            decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
+                            decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
+                            decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
+                            if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
+                                media_urls.append(decoded)
             except Exception as ex:
                 pass
 
-            # Fallback to direct post page scraping if embed didn't yield enough images
+            # 2. Fallback to direct page scraping if embed didn't yield media
             if not media_urls:
                 try:
                     req_post = urllib.request.Request(
@@ -114,22 +120,30 @@ class handler(BaseHTTPRequestHandler):
                     )
                     with urllib.request.urlopen(req_post) as resp_post:
                         html_post = resp_post.read().decode('utf-8', errors='ignore')
-                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_post)
-                        if display_urls:
-                            for u in display_urls:
-                                decoded = u.encode().decode('unicode-escape').replace('\\/', '/')
-                                decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
-                                decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
-                                decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
-                                if decoded not in media_urls:
-                                    media_urls.append(decoded)
-                        
-                        if not media_urls:
-                            og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_post)
-                            if og_match:
-                                og_url = og_match.group(1).replace('&amp;', '&')
-                                og_url = re.sub(r'/s\d+x\d+/', '/', og_url)
-                                media_urls.append(og_url)
+
+                        # Check for video in direct page
+                        vid_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_post)
+                        if vid_matches:
+                            vid_url = vid_matches[0].encode().decode('unicode-escape').replace('\\/', '/')
+                            media_urls.append(vid_url)
+                            is_image = False
+                        else:
+                            display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_post)
+                            if display_urls:
+                                for u in display_urls:
+                                    decoded = u.encode().decode('unicode-escape').replace('\\/', '/')
+                                    decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
+                                    decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
+                                    decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
+                                    if decoded not in media_urls:
+                                        media_urls.append(decoded)
+                            
+                            if not media_urls:
+                                og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_post)
+                                if og_match:
+                                    og_url = og_match.group(1).replace('&amp;', '&')
+                                    og_url = re.sub(r'/s\d+x\d+/', '/', og_url)
+                                    media_urls.append(og_url)
                 except Exception as e2:
                     pass
 
