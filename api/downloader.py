@@ -22,7 +22,7 @@ class handler(BaseHTTPRequestHandler):
 
                 req = urllib.request.Request(
                     target_url,
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 )
                 with urllib.request.urlopen(req) as remote_file:
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
@@ -89,24 +89,16 @@ class handler(BaseHTTPRequestHandler):
                 try:
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
-                        # Check direct video stream
                         media_url = info.get('url')
-                        
-                        # Check requested formats or direct image resources
-                        if not media_url and 'formats' in info and len(info['formats']) > 0:
-                            media_url = info['formats'][-1].get('url')
-
-                        # Check carousel entries for full-size images
                         if not media_url and 'entries' in info and len(info['entries']) > 0:
                             first_entry = info['entries'][0]
                             media_url = first_entry.get('url') or first_entry.get('thumbnail')
 
-                        # Extract highest resolution original image from formats/thumbnails list if available
                         if not media_url or 'ext' in info and info.get('ext') not in ['mp4', 'webm']:
                             if 'thumbnails' in info and len(info['thumbnails']) > 0:
-                                # Sort by resolution width/height to get the tallest/largest uncropped image
-                                sorted_thumbs = sorted(info['thumbnails'], key=lambda x: x.get('width', 0) * x.get('height', 0), reverse=True)
-                                media_url = sorted_thumbs[0].get('url')
+                                # Pick the one with the maximum height (tallest vertical source)
+                                tallest_thumb = max(info['thumbnails'], key=lambda x: x.get('height', 0))
+                                media_url = tallest_thumb.get('url')
                                 is_image = True
                             elif info.get('thumbnail'):
                                 media_url = info.get('thumbnail')
@@ -114,7 +106,6 @@ class handler(BaseHTTPRequestHandler):
                 except Exception as ex:
                     pass
 
-            # Fallback to Open Graph if yt-dlp couldn't resolve
             if not media_url:
                 try:
                     req = urllib.request.Request(
@@ -131,6 +122,10 @@ class handler(BaseHTTPRequestHandler):
                     pass
 
             if media_url:
+                # Strip Instagram sizing filters (e.g. /s640x640/ or dimension constraints) to force full uncropped master image
+                media_url = re.sub(r'/s\d+x\d+/', '/', media_url)
+                media_url = re.sub(r'/p\d+x\d+/', '/', media_url)
+
                 if any(img_ext in media_url.lower() for img_ext in ['.jpg', '.jpeg', '.webp', '.png']):
                     is_image = True
 
