@@ -78,12 +78,11 @@ class handler(BaseHTTPRequestHandler):
             media_url = None
             is_image = False
 
-            # Request Instagram page using mobile user-agent headers to extract video or master photo nodes
             try:
                 req = urllib.request.Request(
                     clean_url,
                     headers={
-                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                         'Accept-Language': 'en-US,en;q=0.5'
                     }
@@ -91,7 +90,7 @@ class handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req) as resp:
                     html_content = resp.read().decode('utf-8', errors='ignore')
 
-                    # 1. Search for video stream if it's a reel/video post
+                    # 1. Check for video streams first
                     video_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
                     if not video_matches:
                         video_matches = re.findall(r'property="og:video"\s+content="([^"]+)"', html_content)
@@ -100,22 +99,36 @@ class handler(BaseHTTPRequestHandler):
                         media_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '/')
                         is_image = False
                     else:
-                        # 2. Search for full-size display_url image nodes
-                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
-                        if display_urls:
-                            media_url = display_urls[0].encode().decode('unicode-escape').replace('\\/', '/')
+                        # 2. Extract full resolution image candidates from JSON graph nodes (avoids 640x640 og:image restriction)
+                        candidates = re.findall(r'"url"\s*:\s*"([^"]+)"', html_content)
+                        valid_candidates = []
+                        for cand in candidates:
+                            decoded_cand = cand.encode().decode('unicode-escape').replace('\\/', '/')
+                            # Filter for Instagram CDN image urls that look like full-res source files
+                            if 'fbcdn.net' in decoded_cand and any(ext in decoded_cand.lower() for ext in ['.jpg', '.jpeg', '.webp']):
+                                if 'p640x640' not in decoded_cand and 's640x640' not in decoded_cand:
+                                    valid_candidates.append(decoded_cand)
+
+                        if valid_candidates:
+                            # Pick the longest/highest fidelity URL or first master candidate
+                            media_url = valid_candidates[0]
                             is_image = True
                         else:
-                            # 3. Fallback to Open Graph meta tag
-                            og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
-                            if og_match:
-                                media_url = og_match.group(1).replace('&amp;', '&')
+                            # 3. Fallback to display_url or og:image if no candidates found
+                            display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
+                            if display_urls:
+                                media_url = display_urls[0].encode().decode('unicode-escape').replace('\\/', '/')
                                 is_image = True
+                            else:
+                                og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
+                                if og_match:
+                                    media_url = og_match.group(1).replace('&amp;', '&')
+                                    is_image = True
             except Exception as ex:
                 pass
 
             if media_url:
-                # Remove Instagram square downscaling query boxes to preserve full vertical resolution
+                # Strip downscaling and crop parameters to force raw master dimensions
                 media_url = re.sub(r'/s\d+x\d+/', '/', media_url)
                 media_url = re.sub(r'/p\d+x\d+/', '/', media_url)
                 media_url = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', media_url)
