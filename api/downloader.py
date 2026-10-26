@@ -83,27 +83,25 @@ class handler(BaseHTTPRequestHandler):
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
+                'extractor_args': {'instagram': {'max_comments': [0]}}
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
-                        # Check if video/reel
                         if info.get('ext') in ['mp4', 'webm'] or info.get('vcodec') != 'none':
                             vid_url = info.get('url')
                             if vid_url:
                                 media_urls.append(vid_url)
                                 is_image = False
 
-                        # Check for carousel entries
                         if 'entries' in info:
                             for entry in info['entries']:
                                 node_url = entry.get('url') or entry.get('thumbnail')
                                 if node_url and node_url not in media_urls:
                                     media_urls.append(node_url)
 
-                        # If single post / thumbnail fallback
                         if not media_urls:
                             if info.get('url'):
                                 media_urls.append(info.get('url'))
@@ -115,7 +113,6 @@ class handler(BaseHTTPRequestHandler):
             if media_urls:
                 cleaned_urls = []
                 for url in media_urls:
-                    # Strip Instagram downscaling & cropping tokens to guarantee original full vertical size
                     clean_img = re.sub(r'/s\d+x\d+/', '/', url)
                     clean_img = re.sub(r'/p\d+x\d+/', '/', clean_img)
                     clean_img = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', clean_img)
