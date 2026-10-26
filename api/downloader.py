@@ -88,20 +88,20 @@ class handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req) as resp:
                     html_content = resp.read().decode('utf-8', errors='ignore')
 
-                    # Check for video streams
                     vid_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
                     if vid_matches:
                         vid_url = vid_matches[0].encode().decode('unicode-escape').replace('\\/', '/').replace('&amp;', '&')
                         media_urls.append(vid_url)
                         is_image = False
                     else:
-                        # Extract all high-res carousel/single image links from embed markup
                         matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
                         for m in matches:
                             decoded = m.encode().decode('unicode-escape').replace('&amp;', '&')
+                            # Thoroughly strip sizing boxes and square cropping tokens to force full vertical ratio
                             decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
                             decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
                             decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
+                            decoded = re.sub(r'[?&]oh=[^&]+', '', decoded)
                             if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
                                 media_urls.append(decoded)
             except Exception as ex:
