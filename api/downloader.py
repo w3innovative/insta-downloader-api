@@ -21,7 +21,7 @@ class handler(BaseHTTPRequestHandler):
 
                 req = urllib.request.Request(
                     target_url,
-                    headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'}
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 )
                 with urllib.request.urlopen(req) as remote_file:
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
@@ -70,19 +70,19 @@ class handler(BaseHTTPRequestHandler):
             if match_post:
                 media_type = match_post.group(1)
                 code = match_post.group(2)
-                if media_type in ['reel', 'reels']:
-                    clean_url = f'https://www.instagram.com/reel/{code}/'
-                else:
-                    clean_url = f'https://www.instagram.com/p/{code}/'
+                # Use Instagram's public embed endpoint which never blocks public posts
+                embed_url = f'https://www.instagram.com/p/{code}/embed/captioned/'
+            else:
+                embed_url = clean_url
 
             media_url = None
             is_image = False
 
             try:
                 req = urllib.request.Request(
-                    clean_url,
+                    embed_url,
                     headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                         'Accept-Language': 'en-US,en;q=0.5'
                     }
@@ -90,45 +90,34 @@ class handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req) as resp:
                     html_content = resp.read().decode('utf-8', errors='ignore')
 
-                    # 1. Check for video streams first
-                    video_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
+                    # 1. Check for video stream in embed
+                    video_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
                     if not video_matches:
-                        video_matches = re.findall(r'property="og:video"\s+content="([^"]+)"', html_content)
+                        video_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
 
-                    if video_matches and ('reel' in clean_url or 'video' in html_content):
-                        media_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '/')
+                    if video_matches and 'mp4' in video_matches[0]:
+                        media_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '&amp;').replace('&amp;', '&')
                         is_image = False
                     else:
-                        # 2. Extract full resolution image candidates from JSON graph nodes (avoids 640x640 og:image restriction)
-                        candidates = re.findall(r'"url"\s*:\s*"([^"]+)"', html_content)
-                        valid_candidates = []
-                        for cand in candidates:
-                            decoded_cand = cand.encode().decode('unicode-escape').replace('\\/', '/')
-                            # Filter for Instagram CDN image urls that look like full-res source files
-                            if 'fbcdn.net' in decoded_cand and any(ext in decoded_cand.lower() for ext in ['.jpg', '.jpeg', '.webp']):
-                                if 'p640x640' not in decoded_cand and 's640x640' not in decoded_cand:
-                                    valid_candidates.append(decoded_cand)
+                        # 2. Extract high-res image source from public embed HTML
+                        img_matches = re.findall(r'class="EmbeddedMediaImage"[^>]+src="([^"]+)"', html_content)
+                        if not img_matches:
+                            img_matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
 
-                        if valid_candidates:
-                            # Pick the longest/highest fidelity URL or first master candidate
-                            media_url = valid_candidates[0]
+                        if img_matches:
+                            media_url = img_matches[0].encode().decode('unicode-escape').replace('&amp;', '&')
                             is_image = True
                         else:
-                            # 3. Fallback to display_url or og:image if no candidates found
-                            display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
-                            if display_urls:
-                                media_url = display_urls[0].encode().decode('unicode-escape').replace('\\/', '/')
+                            # 3. Fallback to Open Graph
+                            og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
+                            if og_match:
+                                media_url = og_match.group(1).replace('&amp;', '&')
                                 is_image = True
-                            else:
-                                og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
-                                if og_match:
-                                    media_url = og_match.group(1).replace('&amp;', '&')
-                                    is_image = True
             except Exception as ex:
                 pass
 
             if media_url:
-                # Strip downscaling and crop parameters to force raw master dimensions
+                # Strip downscaling to pull max resolution available
                 media_url = re.sub(r'/s\d+x\d+/', '/', media_url)
                 media_url = re.sub(r'/p\d+x\d+/', '/', media_url)
                 media_url = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', media_url)
