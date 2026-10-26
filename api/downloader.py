@@ -79,11 +79,12 @@ class handler(BaseHTTPRequestHandler):
             media_url = None
             is_image = False
 
-            # Extract via yt-dlp first
+            # Use yt-dlp with optimized client parameters
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
+                'extractor_args': {'instagram': {'max_comments': [0]}}
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -91,6 +92,7 @@ class handler(BaseHTTPRequestHandler):
                     info = ydl.extract_info(clean_url, download=False)
                     if info:
                         media_url = info.get('url')
+                        
                         if not media_url and 'entries' in info and len(info['entries']) > 0:
                             first_entry = info['entries'][0]
                             media_url = first_entry.get('url') or first_entry.get('thumbnail')
@@ -99,38 +101,19 @@ class handler(BaseHTTPRequestHandler):
                             tallest = max(info['thumbnails'], key=lambda x: x.get('height', 0))
                             media_url = tallest.get('url')
                             is_image = True
+                        elif info.get('thumbnail'):
+                            media_url = info.get('thumbnail')
+                            is_image = True
+
+                        if info.get('ext') in ['jpg', 'png', 'webp', 'heic']:
+                            is_image = True
                 except Exception as ex:
                     pass
 
-            # Fallback to web scraping raw json payload nodes if yt-dlp returns cropped links
-            if not media_url or 's640x640' in media_url:
-                try:
-                    req = urllib.request.Request(
-                        clean_url,
-                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-                    )
-                    with urllib.request.urlopen(req) as resp:
-                        html_content = resp.read().decode('utf-8', errors='ignore')
-                        
-                        # Look for full size display_url or image_versions2 nodes
-                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html_content)
-                        if display_urls:
-                            media_url = display_urls[0].encode().decode('unicode-escape').replace('\\/', '/')
-                            is_image = True
-                        else:
-                            og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
-                            if og_match:
-                                media_url = og_match.group(1).replace('&amp;', '&')
-                                is_image = True
-                except Exception as e:
-                    pass
-
             if media_url:
-                # Forcefully strip out Instagram's square downscaling modifiers and query sizing tokens
+                # Clean up any downscaling parameters to ensure highest available fidelity
                 media_url = re.sub(r'/s\d+x\d+/', '/', media_url)
                 media_url = re.sub(r'/p\d+x\d+/', '/', media_url)
-                # If URL contains dimension restrictions like /sh0.08/e35/c0.0.1080.1080/, remove the square cropping box constraint
-                media_url = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', media_url)
 
                 if any(img_ext in media_url.lower() for img_ext in ['.jpg', '.jpeg', '.webp', '.png']):
                     is_image = True
