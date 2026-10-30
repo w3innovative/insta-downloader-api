@@ -70,22 +70,17 @@ class handler(BaseHTTPRequestHandler):
             if match_post:
                 media_type = match_post.group(1)
                 code = match_post.group(2)
-                if media_type in ['reel', 'reels']:
-                    clean_url = f'https://www.instagram.com/reel/{code}/'
-                    api_endpoint = f'https://www.instagram.com/p/{code}/embed/captioned/'
-                else:
-                    clean_url = f'https://www.instagram.com/p/{code}/'
-                    api_endpoint = f'https://www.instagram.com/p/{code}/embed/captioned/'
+                # Use Instagram's public embed endpoint which never blocks public posts
+                embed_url = f'https://www.instagram.com/p/{code}/embed/captioned/'
             else:
-                api_endpoint = clean_url
+                embed_url = clean_url
 
-            media_urls = []
-            is_image = True
+            media_url = None
+            is_image = False
 
-            # Use Instagram's lightweight embed/shared-data query
             try:
                 req = urllib.request.Request(
-                    api_endpoint,
+                    embed_url,
                     headers={
                         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -95,56 +90,46 @@ class handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req) as resp:
                     html_content = resp.read().decode('utf-8', errors='ignore')
 
-                    # Check for video streams first
-                    vid_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
-                    if not vid_matches:
-                        vid_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
+                    # 1. Check for video stream in embed
+                    video_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
+                    if not video_matches:
+                        video_matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_content)
 
-                    if vid_matches:
-                        vid_url = vid_matches[0].encode().decode('unicode-escape').replace('\\/', '/').replace('&amp;', '&')
-                        media_urls.append(vid_url)
+                    if video_matches and 'mp4' in video_matches[0]:
+                        media_url = video_matches[0].encode().decode('unicode-escape').replace('\\/', '&amp;').replace('&amp;', '&')
                         is_image = False
                     else:
-                        # Grab all carousel or single image CDN elements from the page markup
-                        matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
-                        for m in matches:
-                            decoded = m.encode().decode('unicode-escape').replace('&amp;', '&')
-                            # Strip out square cropping and resizing query constraints
-                            decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
-                            decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
-                            decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
-                            if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
-                                media_urls.append(decoded)
+                        # 2. Extract high-res image source from public embed HTML
+                        img_matches = re.findall(r'class="EmbeddedMediaImage"[^>]+src="([^"]+)"', html_content)
+                        if not img_matches:
+                            img_matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
+
+                        if img_matches:
+                            media_url = img_matches[0].encode().decode('unicode-escape').replace('&amp;', '&')
+                            is_image = True
+                        else:
+                            # 3. Fallback to Open Graph
+                            og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
+                            if og_match:
+                                media_url = og_match.group(1).replace('&amp;', '&')
+                                is_image = True
             except Exception as ex:
                 pass
 
-            # Fallback to direct page scraping if embed didn't return media
-            if not media_urls:
-                try:
-                    req_direct = urllib.request.Request(
-                        clean_url,
-                        headers={
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                            'Accept': 'text/html,xhtml+xml'
-                        }
-                    )
-                    with urllib.request.urlopen(req_direct) as resp_direct:
-                        html_direct = resp_direct.read().decode('utf-8', errors='ignore')
-                        og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_direct)
-                        if og_match:
-                            og_url = og_match.group(1).replace('&amp;', '&')
-                            og_url = re.sub(r'/s\d+x\d+/', '/', og_url)
-                            og_url = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', og_url)
-                            media_urls.append(og_url)
-                except Exception as ex2:
-                    pass
+            if media_url:
+                # Strip downscaling to pull max resolution available
+                media_url = re.sub(r'/s\d+x\d+/', '/', media_url)
+                media_url = re.sub(r'/p\d+x\d+/', '/', media_url)
+                media_url = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', media_url)
 
-            if media_urls:
+                if any(img_ext in media_url.lower() for img_ext in ['.jpg', '.jpeg', '.webp', '.png']):
+                    is_image = True
+
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps({'download_urls': media_urls, 'is_image': is_image}).encode('utf-8'))
+                self.wfile.write(json.dumps({'download_url': media_url, 'is_image': is_image}).encode('utf-8'))
             else:
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
