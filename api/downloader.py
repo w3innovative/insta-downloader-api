@@ -3,7 +3,6 @@ import json
 import urllib.parse
 import urllib.request
 import re
-import yt_dlp
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -72,83 +71,80 @@ class handler(BaseHTTPRequestHandler):
             if match_post:
                 media_type = match_post.group(1)
                 code = match_post.group(2)
-                if media_type in ['reel', 'reels']:
-                    clean_url = f'https://www.instagram.com/reel/{code}/'
-                else:
-                    clean_url = f'https://www.instagram.com/p/{code}/'
+                embed_url = f'https://www.instagram.com/p/{code}/embed/captioned/'
+            else:
+                embed_url = clean_url
 
             media_urls = []
             is_image = True
 
-            # 1. Try yt-dlp first
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-                'extractor_args': {'instagram': {'max_comments': [0]}}
-            }
+            # Use Instagram's public embed & GraphQL JSON payload nodes which bypass bot checks
+            try:
+                req = urllib.request.Request(
+                    embed_url,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5'
+                    }
+                )
+                with urllib.request.urlopen(req) as resp:
+                    html_content = resp.read().decode('utf-8', errors='ignore')
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                try:
-                    info = ydl.extract_info(clean_url, download=False)
-                    if info:
-                        if info.get('ext') in ['mp4', 'webm'] or info.get('vcodec') != 'none':
-                            vid_url = info.get('url')
-                            if vid_url:
-                                media_urls.append(vid_url)
-                                is_image = False
-
-                        if 'entries' in info:
-                            for entry in info['entries']:
-                                node_url = entry.get('url') or entry.get('thumbnail')
-                                if node_url and node_url not in media_urls:
-                                    media_urls.append(node_url)
-
-                        if not media_urls:
-                            if info.get('url'):
-                                media_urls.append(info.get('url'))
-                            elif info.get('thumbnail'):
-                                media_urls.append(info.get('thumbnail'))
-                except Exception as ydl_ex:
-                    pass
-
-            # 2. Bulletproof Fallback: Use Instagram public embed endpoint if yt-dlp fails or misses items
-            if not media_urls and code:
-                try:
-                    embed_url = f'https://www.instagram.com/p/{code}/embed/captioned/'
-                    req = urllib.request.Request(
-                        embed_url,
-                        headers={
-                            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                        }
-                    )
-                    with urllib.request.urlopen(req) as resp:
-                        html_content = resp.read().decode('utf-8', errors='ignore')
+                    # Check for video stream first if reel
+                    vid_matches = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_content)
+                    if vid_matches:
+                        vid_url = vid_matches[0].encode().decode('unicode-escape').replace('\\/', '/').replace('&amp;', '&')
+                        media_urls.append(vid_url)
+                        is_image = False
+                    else:
+                        # Grab all high-res carousel/single image CDN links
                         matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
                         for m in matches:
                             decoded = m.encode().decode('unicode-escape').replace('&amp;', '&')
+                            # Clean up dimensions to guarantee original full vertical size without cropping
+                            decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
+                            decoded = re.sub(r'/p\d+x\d+/', '/', decoded)
+                            decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
                             if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
                                 media_urls.append(decoded)
-                        if media_urls:
-                            is_image = True
-                except Exception as embed_ex:
+            except Exception as ex:
+                pass
+
+            # Fallback direct graph search if embed didn't catch links
+            if not media_urls and code:
+                try:
+                    direct_url = f'https://www.instagram.com/p/{code}/'
+                    req2 = urllib.request.Request(
+                        direct_url,
+                        headers={
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml'
+                        }
+                    )
+                    with urllib.request.urlopen(req2) as resp2:
+                        html2 = resp2.read().decode('utf-8', errors='ignore')
+                        display_urls = re.findall(r'"display_url"\s*:\s*"([^"]+)"', html2)
+                        for u in display_urls:
+                            decoded = u.encode().decode('unicode-escape').replace('\\/', '/')
+                            decoded = re.sub(r'/s\d+x\d+/', '/', decoded)
+                            decoded = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', decoded)
+                            if decoded not in media_urls:
+                                media_urls.append(decoded)
+                        
+                        if not media_urls:
+                            og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html2)
+                            if og_match:
+                                media_urls.append(og_match.group(1).replace('&amp;', '&'))
+                except Exception as ex2:
                     pass
 
             if media_urls:
-                cleaned_urls = []
-                for url in media_urls:
-                    clean_img = re.sub(r'/s\d+x\d+/', '/', url)
-                    clean_img = re.sub(r'/p\d+x\d+/', '/', clean_img)
-                    clean_img = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', clean_img)
-                    if clean_img not in cleaned_urls:
-                        cleaned_urls.append(clean_img)
-
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
-                self.wfile.write(json.dumps({'download_urls': cleaned_urls, 'is_image': is_image}).encode('utf-8'))
+                self.wfile.write(json.dumps({'download_urls': media_urls, 'is_image': is_image}).encode('utf-8'))
             else:
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
