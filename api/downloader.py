@@ -68,6 +68,7 @@ class handler(BaseHTTPRequestHandler):
 
             clean_url = raw_url.split('?')[0]
             match_post = re.search(r'instagram\.com/(?:[\w\.\-]+/)?(p|reel|reels|tv)/([\w\-]+)', clean_url)
+            code = None
             if match_post:
                 media_type = match_post.group(1)
                 code = match_post.group(2)
@@ -79,6 +80,7 @@ class handler(BaseHTTPRequestHandler):
             media_urls = []
             is_image = True
 
+            # 1. Try yt-dlp first
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
@@ -108,6 +110,29 @@ class handler(BaseHTTPRequestHandler):
                             elif info.get('thumbnail'):
                                 media_urls.append(info.get('thumbnail'))
                 except Exception as ydl_ex:
+                    pass
+
+            # 2. Bulletproof Fallback: Use Instagram public embed endpoint if yt-dlp fails or misses items
+            if not media_urls and code:
+                try:
+                    embed_url = f'https://www.instagram.com/p/{code}/embed/captioned/'
+                    req = urllib.request.Request(
+                        embed_url,
+                        headers={
+                            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                        }
+                    )
+                    with urllib.request.urlopen(req) as resp:
+                        html_content = resp.read().decode('utf-8', errors='ignore')
+                        matches = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_content)
+                        for m in matches:
+                            decoded = m.encode().decode('unicode-escape').replace('&amp;', '&')
+                            if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
+                                media_urls.append(decoded)
+                        if media_urls:
+                            is_image = True
+                except Exception as embed_ex:
                     pass
 
             if media_urls:
