@@ -68,59 +68,71 @@ class handler(BaseHTTPRequestHandler):
             clean_url = raw_url.split('?')[0]
             match_post = re.search(r'instagram\.com/(?:[\w\.\-]+/)?(p|reel|reels|tv)/([\w\-]+)', clean_url)
             code = None
+            is_reel_type = False
             if match_post:
+                media_type = match_post.group(1)
                 code = match_post.group(2)
+                if media_type in ['reel', 'reels', 'tv']:
+                    is_reel_type = True
+            
+            if not code:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'Invalid Instagram Post or Reel URL'}).encode('utf-8'))
+                return
 
             media_urls = []
-            is_image = True
+            is_image = not is_reel_type
 
-            # Method 1: Query Instagram's internal mobile JSON info endpoint using authentic IG mobile user agent
-            if code:
-                try:
-                    api_json_url = f'https://www.instagram.com/p/{code}/?__a=1&__d=dis'
-                    req = urllib.request.Request(
-                        api_json_url,
-                        headers={
-                            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 293.0.0.31.107',
-                            'Accept': 'application/json',
-                            'X-IG-App-ID': '936619743392459',
-                            'Sec-Fetch-Site': 'same-origin'
-                        }
-                    )
-                    with urllib.request.urlopen(req) as resp:
-                        res_data = json.loads(resp.read().decode('utf-8', errors='ignore'))
-                        # Navigate JSON graph items
-                        items = res_data.get('items', [])
-                        if not items and 'graphql' in res_data:
-                            post_node = res_data['graphql'].get('shortcode_media', {})
-                            items = [post_node]
+            # Strategy 1: Check mobile JSON internal graph first for direct video streams or full-res images
+            try:
+                api_json_url = f'https://www.instagram.com/p/{code}/?__a=1&__d=dis'
+                req_json = urllib.request.Request(
+                    api_json_url,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 300.0.0.0.0',
+                        'Accept': 'application/json',
+                        'X-IG-App-ID': '936619743392459'
+                    }
+                )
+                with urllib.request.urlopen(req_json) as resp_j:
+                    j_data = json.loads(resp_j.read().decode('utf-8', errors='ignore'))
+                    items = j_data.get('items', [])
+                    if not items and 'graphql' in j_data:
+                        items = [j_data['graphql'].get('shortcode_media', {})]
 
-                        for item in items:
-                            # Check video
-                            if item.get('is_video') or 'video_url' in item:
-                                vid = item.get('video_url')
-                                if vid:
-                                    media_urls.append(vid)
-                                    is_image = False
-                            # Check carousel children sidecars
-                            elif 'edge_sidecar_to_children' in item:
-                                for edge in item['edge_sidecar_to_children'].get('edges', []):
-                                    node = edge.get('node', {})
-                                    img = node.get('display_url')
-                                    if img:
-                                        media_urls.append(img)
-                            # Check single image display url
-                            elif 'display_url' in item:
-                                media_urls.append(item.get('display_url'))
-                            elif 'image_versions2' in item:
-                                candidates = item['image_versions2'].get('candidates', [])
-                                if candidates:
-                                    media_urls.append(candidates[0].get('url'))
-                except Exception as api_ex:
-                    pass
+                    for item in items:
+                        if item.get('is_video') or 'video_url' in item:
+                            vid = item.get('video_url')
+                            if vid:
+                                media_urls.append(vid)
+                                is_image = False
+                                break
+                        elif 'edge_sidecar_to_children' in item:
+                            for edge in item['edge_sidecar_to_children'].get('edges', []):
+                                node = edge.get('node', {})
+                                # Grab high-res resource
+                                resources = node.get('display_resources', [])
+                                if resources:
+                                    media_urls.append(resources[-1].get('src'))
+                                elif 'display_url' in node:
+                                    media_urls.append(node.get('display_url'))
+                            is_image = True
+                        elif 'display_resources' in item:
+                            res = item['display_resources']
+                            if res:
+                                media_urls.append(res[-1].get('src'))
+                            is_image = True
+                        elif 'display_url' in item:
+                            media_urls.append(item.get('display_url'))
+                            is_image = True
+            except Exception as j_ex:
+                pass
 
-            # Method 2: Fallback to scraping the public embed page if mobile JSON block triggers
-            if not media_urls and code:
+            # Strategy 2: Fallback to embed markup parser if JSON endpoint is blocked
+            if not media_urls:
                 try:
                     embed_url = f'https://www.instagram.com/p/{code}/embed/captioned/'
                     req_emb = urllib.request.Request(
@@ -133,21 +145,25 @@ class handler(BaseHTTPRequestHandler):
                     with urllib.request.urlopen(req_emb) as resp_emb:
                         html_emb = resp_emb.read().decode('utf-8', errors='ignore')
                         
+                        # Check video stream in embed
                         vid_m = re.findall(r'src="([^"]+\.mp4[^"]*)"', html_emb)
-                        if vid_m:
+                        if vid_m and is_reel_type:
                             media_urls.append(vid_m[0].encode().decode('unicode-escape').replace('\\/', '/').replace('&amp;', '&'))
                             is_image = False
                         else:
+                            # Grab full-res image links
                             img_m = re.findall(r'src="([^"]+fbcdn\.net[^"]+)"', html_emb)
                             for im in img_m:
                                 decoded = im.encode().decode('unicode-escape').replace('&amp;', '&')
                                 if 's150x150' not in decoded and 's320x320' not in decoded and decoded not in media_urls:
                                     media_urls.append(decoded)
+                            if media_urls:
+                                is_image = True
                 except Exception as emb_ex:
                     pass
 
-            # Method 3: Ultimate Fallback via OpenGraph meta inspection
-            if not media_urls and code:
+            # Strategy 3: Ultimate OpenGraph fallback
+            if not media_urls:
                 try:
                     direct_url = f'https://www.instagram.com/p/{code}/'
                     req_dir = urllib.request.Request(
@@ -156,20 +172,34 @@ class handler(BaseHTTPRequestHandler):
                     )
                     with urllib.request.urlopen(req_dir) as resp_dir:
                         html_dir = resp_dir.read().decode('utf-8', errors='ignore')
-                        og = re.search(r'<meta property="og:image" content="([^"]+)"', html_dir)
-                        if og:
-                            media_urls.append(og.group(1).replace('&amp;', '&'))
+                        
+                        # Check video in meta
+                        og_vid = re.search(r'<meta property="og:video" content="([^"]+)"', html_dir)
+                        if og_vid and is_reel_type:
+                            media_urls.append(og_vid.group(1).replace('&amp;', '&'))
+                            is_image = False
+                        else:
+                            og_img = re.search(r'<meta property="og:image" content="([^"]+)"', html_dir)
+                            if og_img:
+                                media_urls.append(og_img.group(1).replace('&amp;', '&'))
+                                is_image = True
                 except Exception as og_ex:
                     pass
 
             if media_urls:
                 cleaned_urls = []
                 for url in media_urls:
-                    clean_img = re.sub(r'/s\d+x\d+/', '/', url)
-                    clean_img = re.sub(r'/p\d+x\d+/', '/', clean_img)
-                    clean_img = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', clean_img)
-                    if clean_img not in cleaned_urls:
-                        cleaned_urls.append(clean_img)
+                    if is_image:
+                        # Strip sizing and square cropping constraints to enforce original vertical aspect ratio
+                        clean_img = re.sub(r'/s\d+x\d+/', '/', url)
+                        clean_img = re.sub(r'/p\d+x\d+/', '/', clean_img)
+                        clean_img = re.sub(r'/c\d+\.\d+\.\d+\.\d+/', '/', clean_img)
+                        # Force high-res suffix if applicable
+                        if clean_img not in cleaned_urls:
+                            cleaned_urls.append(clean_img)
+                    else:
+                        if url not in cleaned_urls:
+                            cleaned_urls.append(url)
 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
