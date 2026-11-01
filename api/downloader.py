@@ -44,22 +44,40 @@ def fetch_page(url):
 
 def normalize(text):
     """Undo JSON / HTML escaping so URLs can be matched with simple regexes."""
-    text = text.replace('\\/', '/').replace('\\u0026', '&').replace('\\u003d', '=')
-    text = text.replace('\\"', '"')
+    # The JSON can be escaped once or twice (JSON inside a JS string), so each escape may be
+    # preceded by several backslashes. Leftover backslashes would cut URLs short, which drops
+    # the signature (oh=/oe=) at the end and makes Instagram answer 403.
+    text = re.sub(r'\\+u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
+    text = re.sub(r'\\+/', '/', text)
+    text = re.sub(r'\\+"', '"', text)
     return htmllib.unescape(text)
 
 
 def url_score(u, w=None, h=None):
     """Rank an Instagram CDN image URL: uncropped beats square-cropped, then more pixels.
     The URL is never modified (the CDN signature would break); we only choose between variants."""
-    stp = urllib.parse.parse_qs(urllib.parse.urlparse(u).query).get('stp', [''])[0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+    stp = query.get('stp', [''])[0]
+    signed = 1 if ('oh' in query and 'oe' in query) else 0  # unsigned/truncated links give 403
     cropped = bool(re.search(r'(?:^|_)c\d+\.\d+\.\d+\.\d+a?(?:_|$)', stp))
     if w and h:
         pixels = int(w) * int(h)
     else:
         m = re.search(r'(?:^|_)[sp](\d+)x(\d+)(?:_|$)', stp)
         pixels = int(m.group(1)) * int(m.group(2)) if m else 10 ** 7  # no size marker = full size
-    return (0 if cropped else 1, pixels)
+    return (signed, 0 if cropped else 1, pixels)
+
+
+def probe(url):
+    """HTTP status Instagram's CDN gives for this image link (checked from this server)."""
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': UA, 'Range': 'bytes=0-0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
 
 
 def describe_url(u):
@@ -392,7 +410,10 @@ class handler(BaseHTTPRequestHandler):
 
             if media_urls:
                 cleaned_urls = list(dict.fromkeys(media_urls))  # dedupe, keep order
-                return self._json(200, {'download_urls': cleaned_urls, 'is_image': is_image, 'info': diag})
+                info_text = diag
+                if is_image:
+                    info_text += f' | probe_first={probe(cleaned_urls[0])}'
+                return self._json(200, {'download_urls': cleaned_urls, 'is_image': is_image, 'info': info_text})
 
             details = ''
             if last_error:
