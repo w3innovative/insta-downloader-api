@@ -226,8 +226,11 @@ class handler(BaseHTTPRequestHandler):
             if diag:
                 details += (' || ' if details else '') + diag[:400]
 
+            # Details go inside the error text so your existing page shows them
+            # without any change to functions.php. Remove this once it works.
             self._json(500, {
-                'error': 'Could not extract media. Please check if the post is public.',
+                'error': 'Could not extract media. Please check if the post is public. [DEBUG: '
+                         + (details or 'no details') + ']',
                 'details': details,
             })
 
