@@ -128,7 +128,58 @@ class CaptureLogger:
         pass
 
 
-def extract_images_via_ytdlp_dump(url):
+def _walk(obj):
+    """Yield every dict inside a parsed JSON structure."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk(v)
+
+
+def _best_candidate(d):
+    cands = (d.get('image_versions2') or {}).get('candidates') or []
+    return cands[0].get('url') if cands and isinstance(cands[0], dict) else None
+
+
+def _media_from_node(m):
+    """Image URLs belonging to ONE post node (single photo or carousel)."""
+    urls = []
+    carousel = m.get('carousel_media')
+    if isinstance(carousel, list) and carousel:
+        for item in carousel:
+            u = _best_candidate(item) or item.get('display_url')
+            if u:
+                urls.append(u)
+        return urls
+    edges = (m.get('edge_sidecar_to_children') or {}).get('edges') or []
+    if edges:
+        for e in edges:
+            n = e.get('node') or {}
+            u = n.get('display_url') or _best_candidate(n)
+            if u:
+                urls.append(u)
+        return urls
+    u = m.get('display_url') or _best_candidate(m)
+    return [u] if u else []
+
+
+def find_media_for_code(obj, code):
+    """Find the node whose shortcode matches THIS post and return only its images.
+    This stops related / suggested posts in the same response from leaking in."""
+    for d in _walk(obj):
+        if code in (d.get('shortcode'), d.get('code')) and any(
+            k in d for k in ('display_url', 'image_versions2', 'carousel_media', 'edge_sidecar_to_children')
+        ):
+            urls = _media_from_node(d)
+            if urls:
+                return urls
+    return []
+
+
+def extract_images_via_ytdlp_dump(url, post_code):
     """yt-dlp reaches Instagram fine from this server but refuses photo-only posts
     ("There is no video in this post"). Re-run it with page dumping on, capture
     every page/JSON response it downloaded, and read the image URLs from those.
@@ -149,7 +200,8 @@ def extract_images_via_ytdlp_dump(url):
         pass  # expected: "There is no video in this post"
 
     pages, total = 0, 0
-    images = []
+    json_images = []
+    html_first = []
     for line in logger.lines:
         line = line.strip()
         if len(line) < 200:
@@ -160,12 +212,23 @@ def extract_images_via_ytdlp_dump(url):
             continue
         pages += 1
         total += len(text)
-        for u in find_post_images(text):
-            key = urllib.parse.urlparse(u).path.rsplit('/', 1)[-1]
-            if key not in [urllib.parse.urlparse(x).path.rsplit('/', 1)[-1] for x in images]:
-                images.append(u)
 
-    return images, f'ytdlp-dump: lines={len(logger.lines)} pages={pages} bytes={total} images={len(images)}'
+        if not json_images and text.lstrip().startswith('{'):
+            try:
+                json_images = find_media_for_code(json.loads(text), post_code)
+            except Exception:
+                pass
+        elif not html_first and post_code and post_code in text:
+            html_first = find_post_images(text)[:1]  # only the first image, never related posts
+
+    if json_images:
+        images, mode = json_images, 'json'
+    else:
+        images, mode = html_first, 'html-first-only'
+    images = list(dict.fromkeys(images))
+
+    return images, (f'ytdlp-dump: lines={len(logger.lines)} pages={pages} bytes={total} '
+                    f'mode={mode} images={len(images)}')
 
 
 class handler(BaseHTTPRequestHandler):
@@ -230,6 +293,7 @@ class handler(BaseHTTPRequestHandler):
                 else:
                     clean_url = f'https://www.instagram.com/p/{post_code}/'
 
+            is_reel = bool(match_post) and match_post.group(1) in ('reel', 'reels', 'tv')
             media_urls = []
             is_image = True
             last_error = None
@@ -243,10 +307,17 @@ class handler(BaseHTTPRequestHandler):
             }
 
             # Step 1: yt-dlp (works for reels / video posts)
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(clean_url, download=False)
+            info = None
+            for attempt in range(2 if is_reel else 1):  # reels: retry once on a flaky response
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(clean_url, download=False)
+                    last_error = None
+                    break
+                except Exception as ydl_ex:
+                    last_error = str(ydl_ex)
 
+            try:
                 if info:
                     if 'entries' in info:
                         for entry in info['entries']:
@@ -272,13 +343,16 @@ class handler(BaseHTTPRequestHandler):
                 last_error = str(ydl_ex)
 
             # Step 2: fallback for photo-only posts (yt-dlp can't handle them)
-            if not media_urls:
-                media_urls, diag = extract_images_via_ytdlp_dump(clean_url)
+            # Never used for reels: a failed reel must not turn into photos of other posts.
+            if not media_urls and post_code and not is_reel:
+                media_urls, diag = extract_images_via_ytdlp_dump(clean_url, post_code)
                 is_image = True
 
-            # Step 3: last resort, scrape Instagram's embed pages directly
-            if not media_urls and post_code:
-                media_urls, diag2 = extract_images_fallback(post_code)
+            # Step 3: last resort, scrape Instagram's embed pages directly (first image only,
+            # so related posts on the page are never returned)
+            if not media_urls and post_code and not is_reel:
+                found, diag2 = extract_images_fallback(post_code)
+                media_urls = found[:1]
                 diag = (diag + ' | ' if diag else '') + diag2
                 is_image = True
 
