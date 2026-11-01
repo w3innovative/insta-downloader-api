@@ -2,6 +2,7 @@ from http.server import BaseHTTPRequestHandler
 import json
 import re
 import html as htmllib
+import urllib.error
 import urllib.parse
 import urllib.request
 import yt_dlp
@@ -26,48 +27,85 @@ def host_allowed(url):
         return False
 
 
-def fetch_text(url):
+def fetch_page(url):
+    """Returns (status_code, final_url, text). Never raises."""
     req = urllib.request.Request(
         url, headers={'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9'}
     )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return r.read().decode('utf-8', errors='ignore')
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.geturl(), r.read().decode('utf-8', errors='ignore')
+    except urllib.error.HTTPError as e:
+        return e.code, url, ''
+    except Exception as e:
+        return 0, url, str(e)
+
+
+def normalize(text):
+    """Undo JSON / HTML escaping so URLs can be matched with simple regexes."""
+    text = text.replace('\\/', '/').replace('\\u0026', '&').replace('\\u003d', '=')
+    text = text.replace('\\"', '"')
+    return htmllib.unescape(text)
+
+
+CDN_URL_RE = re.compile(
+    r'https?://[^\s"\'<>\\]+?(?:cdninstagram\.com|fbcdn\.net)[^\s"\'<>\\]*'
+)
+
+
+def find_post_images(text):
+    """Pull post-image CDN URLs out of a page. Profile pictures (-19) are skipped."""
+    text = normalize(text)
+    found = []
+    for u in re.findall(r'"display_url"\s*:\s*"(https?://[^"]+)"', text):
+        found.append(u)
+    for u in CDN_URL_RE.findall(text):
+        if re.search(r'-15/', u):  # post media; -19 is profile pics
+            found.append(u)
+
+    images, seen = [], set()
+    for u in found:
+        key = urllib.parse.urlparse(u).path.rsplit('/', 1)[-1]  # same image, different sizes
+        if key and key not in seen:
+            seen.add(key)
+            images.append(u)
+    return images
 
 
 def extract_images_fallback(code):
     """Best-effort image extraction for public photo / carousel posts.
-    yt-dlp only supports posts that contain video, so photo posts use this."""
+    yt-dlp only supports posts that contain video, so photo posts use this.
+    Returns (image_urls, diagnostics_string)."""
     images = []
+    diag = []
 
-    def add(u):
-        u = htmllib.unescape(u)
-        if u.startswith('http') and u not in images:
-            images.append(u)
+    sources = [
+        ('embed-captioned', f'https://www.instagram.com/p/{code}/embed/captioned/'),
+        ('embed', f'https://www.instagram.com/p/{code}/embed/'),
+        ('page', f'https://www.instagram.com/p/{code}/'),
+    ]
 
-    # 1) Embed page (often has all carousel images)
-    try:
-        page = fetch_text(f'https://www.instagram.com/p/{code}/embed/captioned/')
-        for u in re.findall(r'"display_url"\s*:\s*"([^"]+)"', page):
-            try:
-                add(json.loads('"' + u + '"'))
-            except Exception:
-                pass
-        for u in re.findall(r'class="EmbeddedMediaImage"[^>]*src="([^"]+)"', page):
-            add(u)
-    except Exception:
-        pass
+    for name, url in sources:
+        status, final_url, text = fetch_page(url)
+        login_wall = 'accounts/login' in final_url
+        found = find_post_images(text) if status == 200 and not login_wall else []
 
-    # 2) Main page og:image (single image only)
-    if not images:
-        try:
-            page = fetch_text(f'https://www.instagram.com/p/{code}/')
-            m = re.search(r'<meta property="og:image" content="([^"]+)"', page)
+        # og:image as a last resort (single image)
+        if not found and status == 200 and not login_wall:
+            m = (re.search(r'property="og:image"[^>]*content="([^"]+)"', text)
+                 or re.search(r'content="([^"]+)"[^>]*property="og:image"', text))
             if m:
-                add(m.group(1))
-        except Exception:
-            pass
+                found = [htmllib.unescape(m.group(1))]
 
-    return images
+        diag.append(f'{name}: http={status} len={len(text)} login={login_wall} images={len(found)}')
+
+        for u in found:
+            if u not in images:
+                images.append(u)
+        if images:
+            break
+
+    return images, ' | '.join(diag)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -135,6 +173,7 @@ class handler(BaseHTTPRequestHandler):
             media_urls = []
             is_image = True
             last_error = None
+            diag = ''
 
             ydl_opts = {
                 'quiet': True,
@@ -174,16 +213,22 @@ class handler(BaseHTTPRequestHandler):
 
             # Step 2: fallback for photo-only posts (yt-dlp can't handle them)
             if not media_urls and post_code:
-                media_urls = extract_images_fallback(post_code)
+                media_urls, diag = extract_images_fallback(post_code)
                 is_image = True
 
             if media_urls:
                 cleaned_urls = list(dict.fromkeys(media_urls))  # dedupe, keep order
                 return self._json(200, {'download_urls': cleaned_urls, 'is_image': is_image})
 
+            details = ''
+            if last_error:
+                details += 'yt-dlp: ' + last_error[:250]
+            if diag:
+                details += (' || ' if details else '') + diag[:400]
+
             self._json(500, {
                 'error': 'Could not extract media. Please check if the post is public.',
-                'details': (last_error or '')[:300],
+                'details': details,
             })
 
         except Exception as e:
