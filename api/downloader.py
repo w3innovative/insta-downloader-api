@@ -49,6 +49,24 @@ def normalize(text):
     return htmllib.unescape(text)
 
 
+def url_score(u, w=None, h=None):
+    """Rank an Instagram CDN image URL: uncropped beats square-cropped, then more pixels.
+    The URL is never modified (the CDN signature would break); we only choose between variants."""
+    stp = urllib.parse.parse_qs(urllib.parse.urlparse(u).query).get('stp', [''])[0]
+    cropped = bool(re.search(r'(?:^|_)c\d+\.\d+\.\d+\.\d+a?(?:_|$)', stp))
+    if w and h:
+        pixels = int(w) * int(h)
+    else:
+        m = re.search(r'(?:^|_)[sp](\d+)x(\d+)(?:_|$)', stp)
+        pixels = int(m.group(1)) * int(m.group(2)) if m else 10 ** 7  # no size marker = full size
+    return (0 if cropped else 1, pixels)
+
+
+def describe_url(u):
+    stp = urllib.parse.parse_qs(urllib.parse.urlparse(u or '').query).get('stp', [''])[0]
+    return stp[:70] or 'no-stp'
+
+
 CDN_URL_RE = re.compile(
     r'https?://[^\s"\'<>\\]+?(?:cdninstagram\.com|fbcdn\.net)[^\s"\'<>\\]*'
 )
@@ -64,13 +82,18 @@ def find_post_images(text):
         if re.search(r'-15/', u):  # post media; -19 is profile pics
             found.append(u)
 
-    images, seen = [], set()
+    # Same image appears in several sizes / crops: keep the best (largest, uncropped) variant
+    best, order = {}, []
     for u in found:
-        key = urllib.parse.urlparse(u).path.rsplit('/', 1)[-1]  # same image, different sizes
-        if key and key not in seen:
-            seen.add(key)
-            images.append(u)
-    return images
+        key = urllib.parse.urlparse(u).path.rsplit('/', 1)[-1]
+        if not key:
+            continue
+        if key not in best:
+            best[key] = u
+            order.append(key)
+        elif url_score(u) > url_score(best[key]):
+            best[key] = u
+    return [best[k] for k in order]
 
 
 def extract_images_fallback(code):
@@ -140,8 +163,19 @@ def _walk(obj):
 
 
 def _best_candidate(d):
-    cands = (d.get('image_versions2') or {}).get('candidates') or []
-    return cands[0].get('url') if cands and isinstance(cands[0], dict) else None
+    """Best (largest, uncropped) image URL among every variant listed on a media node."""
+    variants = []  # (url, width, height)
+    if d.get('display_url'):
+        variants.append((d['display_url'], None, None))
+    for c in (d.get('image_versions2') or {}).get('candidates') or []:
+        if isinstance(c, dict) and c.get('url'):
+            variants.append((c['url'], c.get('width'), c.get('height')))
+    for r in d.get('display_resources') or []:
+        if isinstance(r, dict) and r.get('src'):
+            variants.append((r['src'], r.get('config_width'), r.get('config_height')))
+    if not variants:
+        return None
+    return max(variants, key=lambda v: url_score(*v))[0]
 
 
 def _media_from_node(m):
@@ -150,7 +184,7 @@ def _media_from_node(m):
     carousel = m.get('carousel_media')
     if isinstance(carousel, list) and carousel:
         for item in carousel:
-            u = _best_candidate(item) or item.get('display_url')
+            u = _best_candidate(item)
             if u:
                 urls.append(u)
         return urls
@@ -158,11 +192,11 @@ def _media_from_node(m):
     if edges:
         for e in edges:
             n = e.get('node') or {}
-            u = n.get('display_url') or _best_candidate(n)
+            u = _best_candidate(n)
             if u:
                 urls.append(u)
         return urls
-    u = m.get('display_url') or _best_candidate(m)
+    u = _best_candidate(m)
     return [u] if u else []
 
 
@@ -228,7 +262,7 @@ def extract_images_via_ytdlp_dump(url, post_code):
     images = list(dict.fromkeys(images))
 
     return images, (f'ytdlp-dump: lines={len(logger.lines)} pages={pages} bytes={total} '
-                    f'mode={mode} images={len(images)}')
+                    f'mode={mode} images={len(images)} first_stp={describe_url(images[0] if images else None)}')
 
 
 class handler(BaseHTTPRequestHandler):
@@ -358,7 +392,7 @@ class handler(BaseHTTPRequestHandler):
 
             if media_urls:
                 cleaned_urls = list(dict.fromkeys(media_urls))  # dedupe, keep order
-                return self._json(200, {'download_urls': cleaned_urls, 'is_image': is_image})
+                return self._json(200, {'download_urls': cleaned_urls, 'is_image': is_image, 'info': diag})
 
             details = ''
             if last_error:
