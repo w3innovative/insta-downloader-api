@@ -130,7 +130,10 @@ def extract_images_fallback(code):
     for name, url in sources:
         status, final_url, text = fetch_page(url)
         login_wall = 'accounts/login' in final_url
-        found = find_post_images(text) if status == 200 and not login_wall else []
+        found = []
+        if status == 200 and not login_wall:
+            # carousel images of THIS post, or just the first image (never related posts)
+            found = find_sidecar_in_text(text, code) or find_post_images(text)[:1]
 
         # og:image as a last resort (single image)
         if not found and status == 200 and not login_wall:
@@ -221,14 +224,72 @@ def _media_from_node(m):
 def find_media_for_code(obj, code):
     """Find the node whose shortcode matches THIS post and return only its images.
     This stops related / suggested posts in the same response from leaking in."""
+    best = []
     for d in _walk(obj):
         if code in (d.get('shortcode'), d.get('code')) and any(
             k in d for k in ('display_url', 'image_versions2', 'carousel_media', 'edge_sidecar_to_children')
         ):
             urls = _media_from_node(d)
-            if urls:
-                return urls
-    return []
+            if len(urls) > len(best):  # the full post node has more images than a stub of it
+                best = urls
+    return best
+
+
+def _balanced(text, start):
+    """Return the JSON object/array that opens at text[start] (string-aware brace matching)."""
+    close = '}' if text[start] == '{' else ']'
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in '{[':
+            depth += 1
+        elif c in '}]':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1] if c == close else None
+    return None
+
+
+def find_sidecar_in_text(text, code):
+    """Carousel images from an HTML page: find the 'children' block that sits closest to
+    this post's shortcode, so suggested/related carousels on the page are not mixed in."""
+    text = normalize(text)
+    anchors = [m.start() for m in re.finditer(r'"(?:shortcode|code)"\s*:\s*"' + re.escape(code) + '"', text)]
+    if not anchors:
+        return []
+
+    candidates = []  # (distance_to_shortcode, urls)
+    for key, opener in (('"edge_sidecar_to_children"', '{'), ('"carousel_media"', '[')):
+        for m in re.finditer(key, text):
+            start = text.find(opener, m.end())
+            if start == -1 or text[m.end():start].strip() != ':':
+                continue
+            blob = _balanced(text, start)
+            if not blob:
+                continue
+            try:
+                data = json.loads(blob)
+            except Exception:
+                continue
+            items = ([e.get('node') or {} for e in data.get('edges', [])]
+                     if isinstance(data, dict) else data)
+            urls = [u for u in (_best_candidate(i) for i in items if isinstance(i, dict)) if u]
+            if len(urls) > 1:
+                dist = min(abs(m.start() - a) for a in anchors)
+                candidates.append((dist, urls))
+
+    if not candidates:
+        return []
+    return min(candidates, key=lambda c: c[0])[1]
 
 
 def extract_images_via_ytdlp_dump(url, post_code):
@@ -253,6 +314,7 @@ def extract_images_via_ytdlp_dump(url, post_code):
 
     pages, total = 0, 0
     json_images = []
+    html_sidecar = []
     html_first = []
     for line in logger.lines:
         line = line.strip()
@@ -265,15 +327,21 @@ def extract_images_via_ytdlp_dump(url, post_code):
         pages += 1
         total += len(text)
 
-        if not json_images and text.lstrip().startswith('{'):
-            try:
-                json_images = find_media_for_code(json.loads(text), post_code)
-            except Exception:
-                pass
-        elif not html_first and post_code and post_code in text:
-            html_first = find_post_images(text)[:1]  # only the first image, never related posts
+        if text.lstrip().startswith('{'):
+            if not json_images:
+                try:
+                    json_images = find_media_for_code(json.loads(text), post_code)
+                except Exception:
+                    pass
+        elif post_code and post_code in text:
+            if not html_sidecar:
+                html_sidecar = find_sidecar_in_text(text, post_code)
+            if not html_first:
+                html_first = find_post_images(text)[:1]  # single photo: never related posts
 
-    if json_images:
+    if len(html_sidecar) > len(json_images):
+        images, mode = html_sidecar, 'html-carousel'
+    elif json_images:
         images, mode = json_images, 'json'
     else:
         images, mode = html_first, 'html-first-only'
@@ -404,7 +472,7 @@ class handler(BaseHTTPRequestHandler):
             # so related posts on the page are never returned)
             if not media_urls and post_code and not is_reel:
                 found, diag2 = extract_images_fallback(post_code)
-                media_urls = found[:1]
+                media_urls = found
                 diag = (diag + ' | ' if diag else '') + diag2
                 is_image = True
 
