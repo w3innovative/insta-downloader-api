@@ -1,4 +1,5 @@
 from http.server import BaseHTTPRequestHandler
+import base64
 import json
 import re
 import html as htmllib
@@ -108,6 +109,65 @@ def extract_images_fallback(code):
     return images, ' | '.join(diag)
 
 
+class CaptureLogger:
+    """Collects yt-dlp's console messages (used to read its page dumps)."""
+
+    def __init__(self):
+        self.lines = []
+
+    def debug(self, msg):
+        self.lines.append(str(msg))
+
+    def info(self, msg):
+        self.lines.append(str(msg))
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+
+def extract_images_via_ytdlp_dump(url):
+    """yt-dlp reaches Instagram fine from this server but refuses photo-only posts
+    ("There is no video in this post"). Re-run it with page dumping on, capture
+    every page/JSON response it downloaded, and read the image URLs from those.
+    Returns (image_urls, diagnostics_string)."""
+    logger = CaptureLogger()
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'dump_intermediate_pages': True,
+        'logger': logger,
+        'extractor_args': {'instagram': {'max_comments': [0]}},
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=False)
+    except Exception:
+        pass  # expected: "There is no video in this post"
+
+    pages, total = 0, 0
+    images = []
+    for line in logger.lines:
+        line = line.strip()
+        if len(line) < 200:
+            continue
+        try:
+            text = base64.b64decode(line, validate=True).decode('utf-8', errors='ignore')
+        except Exception:
+            continue
+        pages += 1
+        total += len(text)
+        for u in find_post_images(text):
+            key = urllib.parse.urlparse(u).path.rsplit('/', 1)[-1]
+            if key not in [urllib.parse.urlparse(x).path.rsplit('/', 1)[-1] for x in images]:
+                images.append(u)
+
+    return images, f'ytdlp-dump: lines={len(logger.lines)} pages={pages} bytes={total} images={len(images)}'
+
+
 class handler(BaseHTTPRequestHandler):
     def _json(self, code, payload):
         self.send_response(code)
@@ -212,8 +272,14 @@ class handler(BaseHTTPRequestHandler):
                 last_error = str(ydl_ex)
 
             # Step 2: fallback for photo-only posts (yt-dlp can't handle them)
+            if not media_urls:
+                media_urls, diag = extract_images_via_ytdlp_dump(clean_url)
+                is_image = True
+
+            # Step 3: last resort, scrape Instagram's embed pages directly
             if not media_urls and post_code:
-                media_urls, diag = extract_images_fallback(post_code)
+                media_urls, diag2 = extract_images_fallback(post_code)
+                diag = (diag + ' | ' if diag else '') + diag2
                 is_image = True
 
             if media_urls:
