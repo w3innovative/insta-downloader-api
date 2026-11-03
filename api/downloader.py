@@ -412,6 +412,97 @@ def story_is_private(obj):
     return any(d.get('is_private') is True and 'username' in d for d in _walk(obj))
 
 
+IG_APP_ID = '936619743392459'
+
+
+def _cookie_pairs(path):
+    """name -> value for the instagram.com cookies in the cookie file."""
+    pairs = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith('#HttpOnly_'):
+                    line = line[len('#HttpOnly_'):]
+                if not line or line.startswith('#'):
+                    continue
+                f = line.split('\t')
+                if len(f) >= 7 and f[0].lstrip('.').endswith('instagram.com'):
+                    pairs[f[5]] = f[6]
+    except Exception:
+        pass
+    return pairs
+
+
+def ig_api_get(path, cookies):
+    """GET an Instagram web-API path with the logged-in cookies. Returns (http_status, body)."""
+    pairs = _cookie_pairs(cookies)
+    headers = {
+        'User-Agent': UA,
+        'Accept': '*/*',
+        'X-IG-App-ID': IG_APP_ID,
+        'X-ASBD-ID': '198387',
+        'X-IG-WWW-Claim': '0',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-CSRFToken': pairs.get('csrftoken', ''),
+        'Origin': 'https://www.instagram.com',
+        'Referer': 'https://www.instagram.com/',
+        'Cookie': '; '.join(f'{k}={v}' for k, v in pairs.items()),
+    }
+    req = urllib.request.Request('https://i.instagram.com/api/v1' + path, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.read().decode('utf-8', errors='ignore')
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode('utf-8', errors='ignore')
+    except Exception as e:
+        return 0, str(e)
+
+
+def _snippet(body, n=160):
+    return re.sub(r'\s+', ' ', body or '')[:n]
+
+
+def story_via_api(who, sid, cookies):
+    """Ask Instagram's API directly (same call the website makes).
+    Returns (items, diagnostics, is_private). Diagnostics show the exact HTTP answer."""
+    if who == 'highlights':
+        reel_id = f'highlight:{sid}'
+        prefix = ''
+    else:
+        status, body = ig_api_get('/users/web_profile_info/?username=' + urllib.parse.quote(who), cookies)
+        uid = None
+        try:
+            uid = json.loads(body)['data']['user']['id']
+        except Exception:
+            pass
+        if not uid:
+            return [], f'profile http={status} body={_snippet(body)}', False
+        reel_id = str(uid)
+        prefix = f'profile http={status} | '
+
+    status, body = ig_api_get('/feed/reels_media/?reel_ids=' + urllib.parse.quote(reel_id, safe=':'), cookies)
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return [], f'{prefix}reels http={status} body={_snippet(body)}', False
+
+    if story_is_private(obj):
+        return [], f'{prefix}reels http={status} private', True
+
+    items = collect_story_items(obj)
+    seen, unique = set(), []
+    for it in items:
+        k = it['pk'] or it['url']
+        if it['url'] and k not in seen:
+            seen.add(k)
+            unique.append(it)
+    diag = f'{prefix}reels http={status} items={len(unique)}'
+    if not unique:
+        diag += f' body={_snippet(body)}'
+    return unique, diag, False
+
+
 def extract_story(url, story_id):
     """Returns (items, diagnostics, status) where items = [{'url':..., 'type': 'image'|'video'}].
     status is '', 'NO_COOKIES' or 'PRIVATE'."""
@@ -419,6 +510,22 @@ def extract_story(url, story_id):
     if not cookies:
         return [], 'no cookies configured', 'NO_COOKIES'
 
+    # Step A: ask Instagram's API directly (also reveals the exact reason if it refuses)
+    api_diag = ''
+    m = re.search(r'/stories/([^/?#]+)/(\d+)', url)
+    if m:
+        api_items, api_diag, api_private = story_via_api(m.group(1), m.group(2), cookies)
+        if api_private:
+            return [], api_diag, 'PRIVATE'
+        if api_items:
+            if story_id:
+                only = [it for it in api_items if it['pk'] == story_id]
+                if only:
+                    api_items = only
+            return ([{'url': i['url'], 'type': i['type']} for i in api_items],
+                    'story: via=api ' + api_diag, '')
+
+    # Step B: yt-dlp
     logger = CaptureLogger()
     opts = {
         'quiet': True,
@@ -484,9 +591,9 @@ def extract_story(url, story_id):
                 items.append({'url': entry['thumbnail'], 'type': 'image', 'pk': ''})
         mode = 'ytdlp-entries'
 
-    diag = f'story: pages={pages} mode={mode} items={len(items)}'
+    diag = f'story: api[{api_diag[:300]}] | pages={pages} mode={mode} items={len(items)}'
     if err:
-        diag += ' | yt-dlp: ' + err[:250]
+        diag += ' | yt-dlp: ' + err[:120]
     return [{'url': i['url'], 'type': i['type']} for i in items], diag, ''
 
 
