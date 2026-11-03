@@ -472,6 +472,9 @@ def story_via_api(who, sid, cookies):
     else:
         status, body = ig_api_get('/users/web_profile_info/?username=' + urllib.parse.quote(who), cookies)
         uid = None
+        if status == 429:
+            # Handle rate limit gracefully by letting yt-dlp handle it or returning diagnostic info
+            return [], f'profile http=429 (Rate Limited by Instagram)', False
         try:
             uid = json.loads(body)['data']['user']['id']
         except Exception:
@@ -482,6 +485,9 @@ def story_via_api(who, sid, cookies):
         prefix = f'profile http={status} | '
 
     status, body = ig_api_get('/feed/reels_media/?reel_ids=' + urllib.parse.quote(reel_id, safe=':'), cookies)
+    if status == 429:
+        return [], f'{prefix}reels http=429 (Rate Limited)', False
+        
     try:
         obj = json.loads(body)
     except Exception:
@@ -525,7 +531,7 @@ def extract_story(url, story_id):
             return ([{'url': i['url'], 'type': i['type']} for i in api_items],
                     'story: via=api ' + api_diag, '')
 
-    # Step B: yt-dlp
+    # Step B: yt-dlp with robust options
     logger = CaptureLogger()
     opts = {
         'quiet': True,
@@ -534,6 +540,7 @@ def extract_story(url, story_id):
         'cookiefile': cookies,
         'dump_intermediate_pages': True,
         'logger': logger,
+        'http_headers': {'User-Agent': UA},
     }
     info, err = None, None
     try:
