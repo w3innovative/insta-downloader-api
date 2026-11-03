@@ -438,8 +438,10 @@ def ig_api_get(path, cookies):
     """GET an Instagram web-API path with the logged-in cookies. Returns (http_status, body)."""
     pairs = _cookie_pairs(cookies)
     headers = {
-        'User-Agent': UA,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
         'X-IG-App-ID': IG_APP_ID,
         'X-ASBD-ID': '198387',
         'X-IG-WWW-Claim': '0',
@@ -447,6 +449,12 @@ def ig_api_get(path, cookies):
         'X-CSRFToken': pairs.get('csrftoken', ''),
         'Origin': 'https://www.instagram.com',
         'Referer': 'https://www.instagram.com/',
+        'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-site',
         'Cookie': '; '.join(f'{k}={v}' for k, v in pairs.items()),
     }
     req = urllib.request.Request('https://i.instagram.com/api/v1' + path, headers=headers)
@@ -531,7 +539,7 @@ def extract_story(url, story_id):
             return ([{'url': i['url'], 'type': i['type']} for i in api_items],
                     'story: via=api ' + api_diag, '')
 
-    # Step B: yt-dlp with robust options
+   # Step B: yt-dlp with robust browser headers
     logger = CaptureLogger()
     opts = {
         'quiet': True,
@@ -540,7 +548,11 @@ def extract_story(url, story_id):
         'cookiefile': cookies,
         'dump_intermediate_pages': True,
         'logger': logger,
-        'http_headers': {'User-Agent': UA},
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
     }
     info, err = None, None
     try:
