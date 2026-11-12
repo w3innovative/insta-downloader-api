@@ -413,12 +413,16 @@ def resolve_tiktok_url(url):
     return url
 
 
-def _tiktok_open(url):
+MOBILE_UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 '
+             '(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1')
+
+
+def _tiktok_open(url, ua=UA):
     """Loads a TikTok page and keeps the cookies TikTok sets. Returns (status, html, cookie_jar)."""
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     req = urllib.request.Request(url, headers={
-        'User-Agent': UA,
+        'User-Agent': ua,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     })
@@ -434,61 +438,116 @@ def _pick_photo_url(url_list):
     return url_list[0]
 
 
-def extract_tiktok_photo(url):
-    try:
-        status, page, jar = _tiktok_open(url)
-    except urllib.error.HTTPError as e:
-        return {'error': f'TikTok photo page returned HTTP {e.code}.'}
-    except Exception as e:
-        return {'error': 'TikTok photo page could not be loaded: ' + str(e)[:120]}
-
-    data = None
+def _page_json(page):
     for script_id in ('__UNIVERSAL_DATA_FOR_REHYDRATION__', 'SIGI_STATE'):
         m = re.search(r'<script[^>]+id="' + script_id + r'"[^>]*>(.*?)</script>', page, re.S)
         if m:
             try:
-                data = json.loads(m.group(1))
-                break
+                return json.loads(m.group(1))
             except Exception:
                 pass
-    if data is None:
-        return {'error': f'Could not read the TikTok photo data (HTTP {status}, {len(page)} bytes). '
-                         'TikTok may be blocking this server.'}
+    return None
 
-    post = None
+
+def _photo_url_lists(data):
+    """One list of URL versions per photo. Looks at imagePost.images first, then at any
+    'images' list whose entries carry imageURL.urlList."""
+    def urls_of(images):
+        out = []
+        for img in images:
+            ul = ((img.get('imageURL') or {}).get('urlList') or []) if isinstance(img, dict) else []
+            ul = [u for u in ul if isinstance(u, str)]
+            if ul:
+                out.append(ul)
+        return out
+
     for d in _walk(data):
         ip = d.get('imagePost')
-        if isinstance(ip, dict) and ip.get('images'):
-            post = d
-            break
-    if post is None:
-        return {'error': 'No photos were found in this TikTok post.'}
+        if isinstance(ip, dict) and isinstance(ip.get('images'), list):
+            found = urls_of(ip['images'])
+            if found:
+                return found
+    for d in _walk(data):
+        imgs = d.get('images')
+        if isinstance(imgs, list) and imgs and all(isinstance(i, dict) and isinstance(i.get('imageURL'), dict) for i in imgs):
+            found = urls_of(imgs)
+            if found:
+                return found
+    return []
 
-    holder = SimpleNamespace(cookiejar=jar)
-    base_headers = {'User-Agent': UA, 'Referer': 'https://www.tiktok.com/'}
 
-    items = []
-    for img in post['imagePost']['images']:
-        url_list = [u for u in ((img.get('imageURL') or {}).get('urlList') or []) if isinstance(u, str)]
-        if not url_list:
+def _photo_meta(data):
+    """Caption and music link of the post."""
+    for d in _walk(data):
+        if 'desc' in d and isinstance(d.get('music'), dict):
+            return d.get('desc') or '', d['music'].get('playUrl') or None
+    return '', None
+
+
+def _tiktok_diag(label, status, page, data):
+    parts = [f'{label}: http={status}', f'bytes={len(page)}', f"imagePost_in_page={'imagePost' in page}"]
+    if 'captcha' in page.lower() or 'verify' in page.lower()[:5000]:
+        parts.append('captcha/verify-text')
+    if data is None:
+        parts.append('no-json')
+    elif isinstance(data, dict):
+        scope = data.get('__DEFAULT_SCOPE__')
+        if isinstance(scope, dict):
+            parts.append('scope=' + ','.join(list(scope.keys())[:6]))
+            vd = scope.get('webapp.video-detail')
+            if isinstance(vd, dict):
+                parts.append(f"detail-status={vd.get('statusCode')}/{str(vd.get('statusMsg'))[:30]}")
+                struct = (vd.get('itemInfo') or {}).get('itemStruct')
+                parts.append('item=' + (','.join(list(struct.keys())[:8]) if isinstance(struct, dict) else 'none'))
+        else:
+            parts.append('keys=' + ','.join(list(data.keys())[:6]))
+    return ' '.join(parts)
+
+
+def extract_tiktok_photo(url):
+    # Try the photo page, the same post as a /video/ link, and a mobile browser view
+    attempts = [('photo', url, UA)]
+    if '/photo/' in url:
+        attempts.append(('video-url', url.replace('/photo/', '/video/'), UA))
+    attempts.append(('mobile', url, MOBILE_UA))
+
+    diags = []
+    for label, page_url, ua in attempts:
+        try:
+            status, page, jar = _tiktok_open(page_url, ua)
+        except urllib.error.HTTPError as e:
+            diags.append(f'{label}: http={e.code}')
             continue
-        photo = _pick_photo_url(url_list)
-        items.append({'url': photo, 'type': 'image', 'h': make_download_token(holder, photo, base_headers)})
-    if not items:
-        return {'error': 'No photos were found in this TikTok post.'}
+        except Exception as e:
+            diags.append(f'{label}: {str(e)[:60]}')
+            continue
 
-    audio_url = (post.get('music') or {}).get('playUrl') or None
-    audio_h = make_download_token(holder, audio_url, base_headers) if audio_url else None
+        data = _page_json(page)
+        url_lists = _photo_url_lists(data) if data is not None else []
+        if not url_lists:
+            diags.append(_tiktok_diag(label, status, page, data))
+            continue
 
-    return {
-        'items': items,
-        'download_urls': [i['url'] for i in items],
-        'is_image': True,
-        'title': post.get('desc', '') or '',
-        'thumbnail': items[0]['url'],
-        'audio_url': audio_url,
-        'audio_h': audio_h,
-    }
+        holder = SimpleNamespace(cookiejar=jar)
+        base_headers = {'User-Agent': ua, 'Referer': 'https://www.tiktok.com/'}
+        items = []
+        for ul in url_lists:
+            photo = _pick_photo_url(ul)
+            items.append({'url': photo, 'type': 'image', 'h': make_download_token(holder, photo, base_headers)})
+
+        desc, audio_url = _photo_meta(data)
+        audio_h = make_download_token(holder, audio_url, base_headers) if audio_url else None
+        return {
+            'items': items,
+            'download_urls': [i['url'] for i in items],
+            'is_image': True,
+            'title': desc,
+            'thumbnail': items[0]['url'],
+            'audio_url': audio_url,
+            'audio_h': audio_h,
+        }
+
+    return {'error': 'No photos were found in this TikTok post. [DEBUG: ' + ' || '.join(diags)[:600] + ']'}
 
 
 # ---------------------------------------------------------------------------
