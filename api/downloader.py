@@ -413,19 +413,31 @@ class handler(BaseHTTPRequestHandler):
                 if not target_url or not host_allowed(target_url):
                     return self._json(400, {'error': 'Invalid or disallowed URL'})
 
-                headers = {
+                req_headers = {
                     'User-Agent': UA,
                     'Referer': 'https://www.tiktok.com/',
                     'Accept': '*/*',
                     'Accept-Language': 'en-US,en;q=0.9',
                 }
-                req = urllib.request.Request(target_url, headers=headers)
+                
+                # Forward range header if present
+                client_range = self.headers.get('Range')
+                if client_range:
+                    req_headers['Range'] = client_range
+
+                req = urllib.request.Request(target_url, headers=req_headers)
                 with urllib.request.urlopen(req, timeout=25) as remote_file:
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
-                    self.send_response(200)
+                    self.send_response(remote_file.status)
                     self.send_header('Content-Type', content_type)
                     self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
                     self.send_header('Access-Control-Allow-Origin', '*')
+                    
+                    if remote_file.headers.get('Content-Length'):
+                        self.send_header('Content-Length', remote_file.headers.get('Content-Length'))
+                    if remote_file.headers.get('Content-Range'):
+                        self.send_header('Content-Range', remote_file.headers.get('Content-Range'))
+                        
                     self.end_headers()
 
                     while True:
