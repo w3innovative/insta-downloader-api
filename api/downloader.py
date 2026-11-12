@@ -640,6 +640,212 @@ def extract_tiktok(url):
         return {'error': err + ' | photo: ' + photo['error']}
 
 
+# ---------------------------------------------------------------------------
+# Facebook (videos, reels, watch, fb.watch links, photos)
+# Videos and reels go through yt-dlp. Photos (and anything yt-dlp cannot read) are read from the
+# Open Graph tags Facebook shows to its own link-preview crawler.
+# Stories need a logged-in account, so they are not supported.
+# ---------------------------------------------------------------------------
+FB_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'
+
+
+def is_facebook_url(raw_url):
+    try:
+        p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+        host = (p.hostname or '').lower()
+    except Exception:
+        return False
+    return (host in ('fb.watch', 'fb.com', 'facebook.com')
+            or host.endswith('.facebook.com') or host.endswith('.fb.com'))
+
+
+def resolve_fb_url(url):
+    """Short and share links (fb.watch/..., facebook.com/share/...) -> the real post link."""
+    p = urllib.parse.urlparse(url)
+    host = (p.hostname or '').lower()
+    if host == 'fb.watch' or '/share/' in p.path:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9'})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                final = r.geturl()
+        except Exception:
+            return url
+        # A login page keeps the real link in its "next" parameter
+        nxt = urllib.parse.parse_qs(urllib.parse.urlparse(final).query).get('next')
+        if '/login' in final and nxt:
+            return nxt[0]
+        return final
+    return url
+
+
+def fb_is_photo(url):
+    p = urllib.parse.urlparse(url)
+    path, query = p.path.lower(), p.query.lower()
+    if any(s in path for s in ('/videos/', '/video/', '/reel/', '/reels/', '/watch')):
+        return False
+    return path.startswith('/photo') or '/photos/' in path or 'fbid=' in query
+
+
+def fb_fetch(url, ua):
+    """Returns (status, final_url, html). Never raises."""
+    req = urllib.request.Request(url, headers={
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.geturl(), r.read().decode('utf-8', errors='ignore')
+    except urllib.error.HTTPError as e:
+        return e.code, url, ''
+    except Exception as e:
+        return 0, url, ''
+
+
+def _og_values(page, prop):
+    vals = []
+    for m in re.finditer(r'<meta\s[^>]*>', page, re.I):
+        tag = m.group(0)
+        if not re.search(r'(?:property|name)\s*=\s*["\']' + re.escape(prop) + r'["\']', tag, re.I):
+            continue
+        cm = re.search(r'content\s*=\s*"([^"]*)"', tag, re.I) or re.search(r"content\s*=\s*'([^']*)'", tag, re.I)
+        if cm:
+            vals.append(htmllib.unescape(cm.group(1)))
+    return vals
+
+
+def _fb_result(items, title='', thumbnail='', qualities=None, audio_url=None, duration=None):
+    return {
+        'items': items,
+        'download_urls': [i['url'] for i in items],
+        'is_image': all(i['type'] == 'image' for i in items),
+        'title': title or '',
+        'thumbnail': thumbnail or '',
+        'qualities': qualities or [],
+        'audio_url': audio_url,
+        'duration': duration,
+    }
+
+
+def fb_pick_formats(info):
+    """Playable files from yt-dlp's format list.
+    Returns (progressive, audio_url): progressive = [(label, url)] best first, files that already
+    contain picture + sound. Separate video-only / audio-only streams cannot be merged on Vercel."""
+    prog, audio = [], []
+    for f in info.get('formats') or []:
+        url = f.get('url')
+        if not url:
+            continue
+        protocol = str(f.get('protocol') or '')
+        if 'm3u8' in protocol or 'dash' in protocol or 'f4m' in protocol:
+            continue
+        vcodec, acodec = f.get('vcodec'), f.get('acodec')
+        if vcodec == 'none' and acodec != 'none':
+            audio.append((f.get('abr') or f.get('tbr') or 0, url))
+        elif vcodec != 'none' and acodec != 'none':
+            prog.append((f.get('height') or 0, f.get('tbr') or 0, f.get('format_id') or '', url))
+    prog.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    out, seen = [], set()
+    for height, _tbr, fid, url in prog:
+        if url in seen:
+            continue
+        seen.add(url)
+        tag = 'HD' if fid == 'hd' else ('SD' if fid == 'sd' else '')
+        label = ' '.join(x for x in (tag, f'{height}p' if height else '') if x) or fid or 'Video'
+        out.append((label, url))
+    audio.sort(reverse=True)
+    return out, (audio[0][1] if audio else None)
+
+
+def fb_video_via_ytdlp(url):
+    opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        return None
+
+    entries = [e for e in (info.get('entries') or []) if e] or [info]
+    items, qualities, audio_url = [], [], None
+    for n, entry in enumerate(entries):
+        prog, audio = fb_pick_formats(entry)
+        best = prog[0][1] if prog else entry.get('url')
+        if not best:
+            continue
+        items.append({'url': best, 'type': 'video'})
+        if n == 0:
+            qualities = [{'label': label, 'url': u} for label, u in prog] or [{'label': 'Video', 'url': best}]
+            audio_url = audio
+    if not items:
+        return None
+
+    first = entries[0]
+    title = (first.get('title') or first.get('description') or '').strip()
+    return _fb_result(items, title[:150], first.get('thumbnail'), qualities, audio_url, first.get('duration'))
+
+
+def fb_open_graph_media(url):
+    """Photos / videos from the preview tags Facebook shows to its own crawler."""
+    status, final, page = fb_fetch(url, FB_UA)
+    if status != 200 or not page:
+        return {'diag': f'og: http={status}'}
+    if '/login' in final and 'next=' in final:
+        return {'diag': 'og: login wall'}
+
+    title = (_og_values(page, 'og:title') or [''])[0]
+    thumb = (_og_values(page, 'og:image') or [''])[0]
+
+    videos = []
+    for prop in ('og:video:secure_url', 'og:video:url', 'og:video'):
+        for v in _og_values(page, prop):
+            host = (urllib.parse.urlparse(v).hostname or '').lower()
+            if v.startswith('http') and (host.endswith('fbcdn.net') or urllib.parse.urlparse(v).path.lower().endswith('.mp4')):
+                videos.append(v)
+    if videos:
+        return _fb_result([{'url': videos[0], 'type': 'video'}], title, thumb,
+                          [{'label': 'Video', 'url': videos[0]}])
+
+    images = []
+    for v in _og_values(page, 'og:image'):
+        host = (urllib.parse.urlparse(v).hostname or '').lower()
+        if host.endswith('fbcdn.net') and '/rsrc.php' not in v and v not in images:
+            images.append(v)
+    if images:
+        return _fb_result([{'url': u, 'type': 'image'} for u in images], title, images[0])
+
+    return {'diag': f'og: http={status} bytes={len(page)} images=0 video=0'}
+
+
+def extract_facebook(raw_url):
+    url = resolve_fb_url(raw_url.strip())
+
+    if '/stories/' in urllib.parse.urlparse(url).path.lower():
+        return {'error': 'Facebook stories can only be viewed when logged in, so they cannot be downloaded here.'}
+
+    notes = []
+    if not fb_is_photo(url):
+        try:
+            result = fb_video_via_ytdlp(url)
+            if result:
+                return result
+            notes.append('yt-dlp: no playable video')
+        except Exception as e:
+            notes.append('yt-dlp: ' + re.sub(r'\s+', ' ', str(e))[:180])
+
+    og = fb_open_graph_media(url)
+    if og.get('items'):
+        return og
+    if og.get('diag'):
+        notes.append(og['diag'])
+
+    joined = ' | '.join(notes)
+    if re.search(r'log ?in|private|not available|permission', joined, re.I):
+        msg = 'This Facebook content looks private or needs a login, so it cannot be downloaded.'
+    else:
+        msg = 'Could not get this Facebook content. It may be private or deleted, or Facebook may be blocking the request.'
+    return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
+
+
 class handler(BaseHTTPRequestHandler):
     def _json(self, code, payload):
         self.send_response(code)
@@ -727,6 +933,13 @@ class handler(BaseHTTPRequestHandler):
             # ---- TikTok Route ----
             if 'tiktok.com' in raw_url:
                 result = extract_tiktok(raw_url)
+                if 'error' in result:
+                    return self._json(500, {'error': result['error']})
+                return self._json(200, result)
+
+            # ---- Facebook Route ----
+            if is_facebook_url(raw_url):
+                result = extract_facebook(raw_url)
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
