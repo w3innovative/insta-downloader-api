@@ -1309,23 +1309,41 @@ class handler(BaseHTTPRequestHandler):
                 return self._json(200, result)
 
             # ---- YouTube Route ----
-            if is_youtube_url(raw_url):
-                if str(data.get('mode') or '') == 'cobalt_get':
-                    vid = yt_video_id(raw_url)
-                    if not vid or not cobalt_instances():
-                        return self._json(400, {'error': 'Could not find a video in this link.'})
-                    got, notes = cobalt_get(f'https://www.youtube.com/watch?v={vid}',
-                                            'audio' if data.get('kind') == 'audio' else 'video',
-                                            str(data.get('quality') or ''))
-                    if not got:
-                        return self._json(500, {'error': 'The download service could not prepare this file. '
-                                                         'Please try again or pick another quality. [DEBUG: '
-                                                         + ' | '.join(notes)[:300] + ']'})
-                    return self._json(200, got)
-                result = extract_youtube(raw_url, str(data.get('mode') or 'video'))
-                if 'error' in result:
-                    return self._json(500, {'error': result['error']})
-                return self._json(200, result)
+            if 'youtube.com' in raw_url or 'youtu.be' in raw_url:
+                try:
+                    gateway_payload = json.dumps({
+                        "url": raw_url,
+                        "vQuality": "max"
+                    }).encode('utf-8')
+
+                    req = urllib.request.Request(
+                        "https://api.cobalt.tools/api/json",
+                        data=gateway_payload,
+                        headers={
+                            'User-Agent': UA,
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json'
+                        },
+                        method='POST'
+                    )
+
+                    with urllib.request.urlopen(req, timeout=25) as resp:
+                        res_data = json.loads(resp.read().decode('utf-8', errors='ignore'))
+                        status = res_data.get('status')
+
+                        if status in ['stream', 'redirect']:
+                            media_url = res_data.get('url')
+                            filename_title = res_data.get('filename', 'youtube-video.mp4')
+                            if media_url:
+                                return self._json(200, {
+                                    'download_urls': [media_url],
+                                    'is_image': False,
+                                    'title': filename_title
+                                })
+                        
+                        return self._json(500, {'error': 'Could not extract YouTube media stream.'})
+                except Exception as yt_ex:
+                    return self._json(500, {'error': 'YouTube extraction error: ' + str(yt_ex)[:200]})
 
             # ---- Instagram Route ----
             if 'instagram.com' not in raw_url:
