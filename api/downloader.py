@@ -1,9 +1,11 @@
 from http.server import BaseHTTPRequestHandler
 import base64
+import http.cookiejar
 import json
 import os
 import re
 import html as htmllib
+from types import SimpleNamespace
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,7 +23,11 @@ ALLOWED_PROXY_SUFFIXES = (
     'tiktok.com',
     'tiktokcdn.com',
     'tiktokcdn-us.com',
-    'byteoversea.com'
+    'tiktokcdn-eu.com',
+    'byteoversea.com',
+    'ibyteimg.com',
+    'ibytedtos.com',
+    'muscdn.com'
 )
 
 
@@ -389,9 +395,112 @@ def proxy_request_headers(target_url, h_param, client_range):
 
 
 # ---------------------------------------------------------------------------
+# TikTok photo / slideshow posts
+# yt-dlp does not support tiktok.com/@user/photo/ID links ("Unsupported URL"), so these are
+# read straight from the TikTok page, which contains the post data as JSON.
+# ---------------------------------------------------------------------------
+def resolve_tiktok_url(url):
+    """Short links (vm.tiktok.com, vt.tiktok.com, tiktok.com/t/...) -> the full post link."""
+    p = urllib.parse.urlparse(url)
+    host = (p.hostname or '').lower()
+    if host in ('vm.tiktok.com', 'vt.tiktok.com') or p.path.startswith('/t/'):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': UA})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.geturl().split('?')[0]
+        except Exception:
+            pass
+    return url
+
+
+def _tiktok_open(url):
+    """Loads a TikTok page and keeps the cookies TikTok sets. Returns (status, html, cookie_jar)."""
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    req = urllib.request.Request(url, headers={
+        'User-Agent': UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    with opener.open(req, timeout=20) as r:
+        return r.status, r.read().decode('utf-8', errors='ignore'), jar
+
+
+def _pick_photo_url(url_list):
+    """TikTok lists several versions of each photo; prefer a plain JPEG."""
+    for u in url_list:
+        if re.search(r'jpe?g', u.split('?')[0], re.I):
+            return u
+    return url_list[0]
+
+
+def extract_tiktok_photo(url):
+    try:
+        status, page, jar = _tiktok_open(url)
+    except urllib.error.HTTPError as e:
+        return {'error': f'TikTok photo page returned HTTP {e.code}.'}
+    except Exception as e:
+        return {'error': 'TikTok photo page could not be loaded: ' + str(e)[:120]}
+
+    data = None
+    for script_id in ('__UNIVERSAL_DATA_FOR_REHYDRATION__', 'SIGI_STATE'):
+        m = re.search(r'<script[^>]+id="' + script_id + r'"[^>]*>(.*?)</script>', page, re.S)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                break
+            except Exception:
+                pass
+    if data is None:
+        return {'error': f'Could not read the TikTok photo data (HTTP {status}, {len(page)} bytes). '
+                         'TikTok may be blocking this server.'}
+
+    post = None
+    for d in _walk(data):
+        ip = d.get('imagePost')
+        if isinstance(ip, dict) and ip.get('images'):
+            post = d
+            break
+    if post is None:
+        return {'error': 'No photos were found in this TikTok post.'}
+
+    holder = SimpleNamespace(cookiejar=jar)
+    base_headers = {'User-Agent': UA, 'Referer': 'https://www.tiktok.com/'}
+
+    items = []
+    for img in post['imagePost']['images']:
+        url_list = [u for u in ((img.get('imageURL') or {}).get('urlList') or []) if isinstance(u, str)]
+        if not url_list:
+            continue
+        photo = _pick_photo_url(url_list)
+        items.append({'url': photo, 'type': 'image', 'h': make_download_token(holder, photo, base_headers)})
+    if not items:
+        return {'error': 'No photos were found in this TikTok post.'}
+
+    audio_url = (post.get('music') or {}).get('playUrl') or None
+    audio_h = make_download_token(holder, audio_url, base_headers) if audio_url else None
+
+    return {
+        'items': items,
+        'download_urls': [i['url'] for i in items],
+        'is_image': True,
+        'title': post.get('desc', '') or '',
+        'thumbnail': items[0]['url'],
+        'audio_url': audio_url,
+        'audio_h': audio_h,
+    }
+
+
+# ---------------------------------------------------------------------------
 # TikTok Extraction Feature
 # ---------------------------------------------------------------------------
 def extract_tiktok(url):
+    url = resolve_tiktok_url(url)
+
+    # Photo / slideshow posts are not supported by yt-dlp
+    if re.search(r'tiktok\.com/@[^/]+/photo/\d+', url):
+        return extract_tiktok_photo(url)
+
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -454,7 +563,12 @@ def extract_tiktok(url):
                 'audio_h': audio_h,
             }
     except Exception as e:
-        return {'error': 'TikTok extraction error: ' + str(e)[:200]}
+        err = 'TikTok extraction error: ' + str(e)[:200]
+        # A "video" link can also be a photo slideshow: try reading it as one
+        photo = extract_tiktok_photo(url)
+        if 'error' not in photo:
+            return photo
+        return {'error': err + ' | photo: ' + photo['error']}
 
 
 class handler(BaseHTTPRequestHandler):
@@ -474,6 +588,7 @@ class handler(BaseHTTPRequestHandler):
                 query_params = urllib.parse.parse_qs(parsed_url.query)
                 target_url = query_params.get('url', [None])[0]
                 filename = query_params.get('filename', ['media-download'])[0].replace('"', '')
+                inline = query_params.get('inline', ['0'])[0] == '1'  # 1 = play in the page, 0 = download
 
                 if not target_url or not host_allowed(target_url):
                     return self._json(400, {'error': 'Invalid or disallowed URL'})
@@ -486,8 +601,10 @@ class handler(BaseHTTPRequestHandler):
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
                     self.send_response(remote_file.status)
                     self.send_header('Content-Type', content_type)
-                    self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                    self.send_header('Content-Disposition',
+                                     f'{"inline" if inline else "attachment"}; filename="{filename}"')
                     self.send_header('Access-Control-Allow-Origin', '*')
+                    self.send_header('Accept-Ranges', remote_file.headers.get('Accept-Ranges', 'bytes'))
 
                     if remote_file.headers.get('Content-Length'):
                         self.send_header('Content-Length', remote_file.headers.get('Content-Length'))
@@ -502,6 +619,8 @@ class handler(BaseHTTPRequestHandler):
                             break
                         self.wfile.write(chunk)
                 return
+            except (BrokenPipeError, ConnectionResetError):
+                return  # the video player closed the connection (normal while seeking / previewing)
             except urllib.error.HTTPError as e:
                 return self._json(502, {
                     'error': f'Upstream {e.code} from {urllib.parse.urlparse(target_url or "").hostname} '
