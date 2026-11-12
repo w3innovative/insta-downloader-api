@@ -15,7 +15,14 @@ UA = (
 )
 
 # Allowed CDN hosts for Instagram and TikTok media proxying
-ALLOWED_PROXY_SUFFIXES = ('cdninstagram.com', 'fbcdn.net', 'tiktokcdn.com', 'tiktokcdn-us.com', 'byteoversea.com')
+ALLOWED_PROXY_SUFFIXES = (
+    'cdninstagram.com', 
+    'fbcdn.net', 
+    'tiktok.com',          
+    'tiktokcdn.com', 
+    'tiktokcdn-us.com', 
+    'byteoversea.com'
+)
 
 
 def host_allowed(url):
