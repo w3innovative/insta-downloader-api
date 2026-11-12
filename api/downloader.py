@@ -16,11 +16,11 @@ UA = (
 
 # Allowed CDN hosts for Instagram and TikTok media proxying
 ALLOWED_PROXY_SUFFIXES = (
-    'cdninstagram.com', 
-    'fbcdn.net', 
-    'tiktok.com',          
-    'tiktokcdn.com', 
-    'tiktokcdn-us.com', 
+    'cdninstagram.com',
+    'fbcdn.net',
+    'tiktok.com',
+    'tiktokcdn.com',
+    'tiktokcdn-us.com',
     'byteoversea.com'
 )
 
@@ -178,7 +178,8 @@ def _walk(obj):
         for v in obj.values():
             yield from _walk(v)
     elif isinstance(obj, list):
-        yield from _walk(v)
+        for v in obj:
+            yield from _walk(v)
 
 
 def _best_candidate(d):
@@ -339,6 +340,55 @@ def extract_images_via_ytdlp_dump(url, post_code):
 
 
 # ---------------------------------------------------------------------------
+# TikTok download headers
+# TikTok's media links only work with the cookies / headers that were used to fetch the
+# page (e.g. the tt_chain_token cookie). yt-dlp knows them, so they are packed into a small
+# token that the page sends back, and the proxy forwards them to TikTok's CDN.
+# ---------------------------------------------------------------------------
+FORWARDED_HEADERS = ('User-Agent', 'Referer', 'Cookie', 'Accept', 'Accept-Language')
+
+
+def make_download_token(ydl, media_url, base_headers):
+    """Packs the cookies/headers TikTok needs for this media link into a small token."""
+    host = (urllib.parse.urlparse(media_url).hostname or '').lower()
+    cookies = []
+    try:
+        for c in ydl.cookiejar:
+            d = (c.domain or '').lstrip('.').lower()
+            if d and (host == d or host.endswith('.' + d)):
+                cookies.append(f'{c.name}={c.value}')
+    except Exception:
+        pass
+    h = {k: v for k, v in (base_headers or {}).items() if k in FORWARDED_HEADERS and isinstance(v, str)}
+    h.setdefault('User-Agent', UA)
+    h.setdefault('Referer', 'https://www.tiktok.com/')
+    if cookies:
+        h['Cookie'] = '; '.join(cookies)
+    raw = json.dumps(h, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def proxy_request_headers(target_url, h_param, client_range):
+    """Headers the proxy sends to the CDN, plus the token's headers if given."""
+    host = (urllib.parse.urlparse(target_url or '').hostname or '').lower()
+    headers = {'User-Agent': UA, 'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9'}
+    if 'tiktok' in host or host.endswith('byteoversea.com'):
+        headers['Referer'] = 'https://www.tiktok.com/'
+    if h_param:
+        try:
+            extra = json.loads(base64.urlsafe_b64decode(h_param + '=' * (-len(h_param) % 4)))
+            for k in FORWARDED_HEADERS:
+                v = extra.get(k)
+                if isinstance(v, str) and '\n' not in v and '\r' not in v:
+                    headers[k] = v
+        except Exception:
+            pass
+    if client_range:
+        headers['Range'] = client_range
+    return headers
+
+
+# ---------------------------------------------------------------------------
 # TikTok Extraction Feature
 # ---------------------------------------------------------------------------
 def extract_tiktok(url):
@@ -350,13 +400,13 @@ def extract_tiktok(url):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
+
             title = info.get('title', '')
             thumbnail = info.get('thumbnail', '')
-            audio_url = None
+            audio_url, audio_h = None, None
             items = []
 
-            # Check if it's a photo/slideshow collection or single video
+            # Photo/slideshow collection or single video
             entries = info.get('entries')
             if entries:
                 for entry in entries:
@@ -364,19 +414,31 @@ def extract_tiktok(url):
                         continue
                     img_url = entry.get('url') or entry.get('thumbnail')
                     if img_url:
-                        items.append({'url': img_url, 'type': 'image'})
+                        items.append({
+                            'url': img_url,
+                            'type': 'image',
+                            'h': make_download_token(ydl, img_url, entry.get('http_headers') or info.get('http_headers')),
+                        })
             else:
                 video_url = info.get('url')
                 if video_url:
-                    items.append({'url': video_url, 'type': 'video'})
+                    items.append({
+                        'url': video_url,
+                        'type': 'video',
+                        'h': make_download_token(ydl, video_url, info.get('http_headers')),
+                    })
                 elif thumbnail:
-                    items.append({'url': thumbnail, 'type': 'image'})
+                    items.append({
+                        'url': thumbnail,
+                        'type': 'image',
+                        'h': make_download_token(ydl, thumbnail, info.get('http_headers')),
+                    })
 
-            # Extract background music / audio track if available
-            formats = info.get('formats', [])
-            for f in formats:
-                if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url'):
+            # Background music / audio track if available
+            for f in info.get('formats') or []:
+                if f.get('acodec') not in (None, 'none') and f.get('vcodec') == 'none' and f.get('url'):
                     audio_url = f['url']
+                    audio_h = make_download_token(ydl, audio_url, f.get('http_headers') or info.get('http_headers'))
                     break
 
             if not items:
@@ -388,7 +450,8 @@ def extract_tiktok(url):
                 'is_image': all(i['type'] == 'image' for i in items),
                 'title': title,
                 'thumbnail': thumbnail,
-                'audio_url': audio_url
+                'audio_url': audio_url,
+                'audio_h': audio_h,
             }
     except Exception as e:
         return {'error': 'TikTok extraction error: ' + str(e)[:200]}
@@ -404,6 +467,8 @@ class handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if '?url=' in self.path:
+            target_url = None
+            req_headers = {}
             try:
                 parsed_url = urllib.parse.urlparse(self.path)
                 query_params = urllib.parse.parse_qs(parsed_url.query)
@@ -413,17 +478,8 @@ class handler(BaseHTTPRequestHandler):
                 if not target_url or not host_allowed(target_url):
                     return self._json(400, {'error': 'Invalid or disallowed URL'})
 
-                req_headers = {
-                    'User-Agent': UA,
-                    'Referer': 'https://www.tiktok.com/',
-                    'Accept': '*/*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                }
-                
-                # Forward range header if present
-                client_range = self.headers.get('Range')
-                if client_range:
-                    req_headers['Range'] = client_range
+                req_headers = proxy_request_headers(
+                    target_url, query_params.get('h', [None])[0], self.headers.get('Range'))
 
                 req = urllib.request.Request(target_url, headers=req_headers)
                 with urllib.request.urlopen(req, timeout=25) as remote_file:
@@ -432,12 +488,12 @@ class handler(BaseHTTPRequestHandler):
                     self.send_header('Content-Type', content_type)
                     self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
                     self.send_header('Access-Control-Allow-Origin', '*')
-                    
+
                     if remote_file.headers.get('Content-Length'):
                         self.send_header('Content-Length', remote_file.headers.get('Content-Length'))
                     if remote_file.headers.get('Content-Range'):
                         self.send_header('Content-Range', remote_file.headers.get('Content-Range'))
-                        
+
                     self.end_headers()
 
                     while True:
@@ -446,6 +502,11 @@ class handler(BaseHTTPRequestHandler):
                             break
                         self.wfile.write(chunk)
                 return
+            except urllib.error.HTTPError as e:
+                return self._json(502, {
+                    'error': f'Upstream {e.code} from {urllib.parse.urlparse(target_url or "").hostname} '
+                             f'(cookie sent: {"Cookie" in req_headers})'
+                })
             except Exception as e:
                 return self._json(500, {'error': str(e)})
 
@@ -468,7 +529,7 @@ class handler(BaseHTTPRequestHandler):
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
 
-            # ---- Instagram Route (Unchanged) ----
+            # ---- Instagram Route ----
             if 'instagram.com' not in raw_url:
                 return self._json(400, {'error': 'Invalid social media URL'})
 
