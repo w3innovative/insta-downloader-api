@@ -1309,39 +1309,13 @@ class handler(BaseHTTPRequestHandler):
                 return self._json(200, result)
 
             # ---- YouTube Route ----
-            if 'youtube.com' in raw_url or 'youtu.be' in raw_url:
+            if is_youtube_url(raw_url):
                 try:
-                    gateway_payload = json.dumps({
-                        "url": raw_url,
-                        "vQuality": "max"
-                    }).encode('utf-8')
-
-                    req = urllib.request.Request(
-                        "https://api.cobalt.tools/api/json",
-                        data=gateway_payload,
-                        headers={
-                            'User-Agent': UA,
-                            'Accept': 'application/json',
-                            'Content-Type': 'application/json'
-                        },
-                        method='POST'
-                    )
-
-                    with urllib.request.urlopen(req, timeout=25) as resp:
-                        res_data = json.loads(resp.read().decode('utf-8', errors='ignore'))
-                        status = res_data.get('status')
-
-                        if status in ['stream', 'redirect']:
-                            media_url = res_data.get('url')
-                            filename_title = res_data.get('filename', 'youtube-video.mp4')
-                            if media_url:
-                                return self._json(200, {
-                                    'download_urls': [media_url],
-                                    'is_image': False,
-                                    'title': filename_title
-                                })
-                        
-                        return self._json(500, {'error': 'Could not extract YouTube media stream.'})
+                    mode = data.get('mode', 'video')
+                    result = extract_youtube(raw_url, mode=mode)
+                    if 'error' in result:
+                        return self._json(500, {'error': result['error']})
+                    return self._json(200, result)
                 except Exception as yt_ex:
                     return self._json(500, {'error': 'YouTube extraction error: ' + str(yt_ex)[:200]})
 
