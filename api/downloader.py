@@ -1,6 +1,7 @@
 from http.server import BaseHTTPRequestHandler
 import base64
 import json
+import os
 import re
 import html as htmllib
 import urllib.error
@@ -13,8 +14,8 @@ UA = (
     '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'
 )
 
-# The proxy (GET ?url=) only fetches from Instagram's CDN hosts
-ALLOWED_PROXY_SUFFIXES = ('cdninstagram.com', 'fbcdn.net')
+# Allowed CDN hosts for Instagram and TikTok media proxying
+ALLOWED_PROXY_SUFFIXES = ('cdninstagram.com', 'fbcdn.net', 'tiktokcdn.com', 'tiktokcdn-us.com', 'byteoversea.com')
 
 
 def host_allowed(url):
@@ -44,9 +45,6 @@ def fetch_page(url):
 
 def normalize(text):
     """Undo JSON / HTML escaping so URLs can be matched with simple regexes."""
-    # The JSON can be escaped once or twice (JSON inside a JS string), so each escape may be
-    # preceded by several backslashes. Leftover backslashes would cut URLs short, which drops
-    # the signature (oh=/oe=) at the end and makes Instagram answer 403.
     text = re.sub(r'\\+u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
     text = re.sub(r'\\+/', '/', text)
     text = re.sub(r'\\+"', '"', text)
@@ -54,17 +52,16 @@ def normalize(text):
 
 
 def url_score(u, w=None, h=None):
-    """Rank an Instagram CDN image URL: uncropped beats square-cropped, then more pixels.
-    The URL is never modified (the CDN signature would break); we only choose between variants."""
+    """Rank an Instagram CDN image URL: uncropped beats square-cropped, then more pixels."""
     query = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
     stp = query.get('stp', [''])[0]
-    signed = 1 if ('oh' in query and 'oe' in query) else 0  # unsigned/truncated links give 403
+    signed = 1 if ('oh' in query and 'oe' in query) else 0
     cropped = bool(re.search(r'(?:^|_)c\d+\.\d+\.\d+\.\d+a?(?:_|$)', stp))
     if w and h:
         pixels = int(w) * int(h)
     else:
         m = re.search(r'(?:^|_)[sp](\d+)x(\d+)(?:_|$)', stp)
-        pixels = int(m.group(1)) * int(m.group(2)) if m else 10 ** 7  # no size marker = full size
+        pixels = int(m.group(1)) * int(m.group(2)) if m else 10 ** 7
     return (signed, 0 if cropped else 1, pixels)
 
 
@@ -97,10 +94,9 @@ def find_post_images(text):
     for u in re.findall(r'"display_url"\s*:\s*"(https?://[^"]+)"', text):
         found.append(u)
     for u in CDN_URL_RE.findall(text):
-        if re.search(r'-15/', u):  # post media; -19 is profile pics
+        if re.search(r'-15/', u):
             found.append(u)
 
-    # Same image appears in several sizes / crops: keep the best (largest, uncropped) variant
     best, order = {}, []
     for u in found:
         key = urllib.parse.urlparse(u).path.rsplit('/', 1)[-1]
@@ -115,9 +111,7 @@ def find_post_images(text):
 
 
 def extract_images_fallback(code):
-    """Best-effort image extraction for public photo / carousel posts.
-    yt-dlp only supports posts that contain video, so photo posts use this.
-    Returns (image_urls, diagnostics_string)."""
+    """Best-effort image extraction for public photo / carousel posts."""
     images = []
     diag = []
 
@@ -132,10 +126,8 @@ def extract_images_fallback(code):
         login_wall = 'accounts/login' in final_url
         found = []
         if status == 200 and not login_wall:
-            # carousel images of THIS post, or just the first image (never related posts)
             found = find_sidecar_in_text(text, code) or find_post_images(text)[:1]
 
-        # og:image as a last resort (single image)
         if not found and status == 200 and not login_wall:
             m = (re.search(r'property="og:image"[^>]*content="([^"]+)"', text)
                  or re.search(r'content="([^"]+)"[^>]*property="og:image"', text))
@@ -154,7 +146,7 @@ def extract_images_fallback(code):
 
 
 class CaptureLogger:
-    """Collects yt-dlp's console messages (used to read its page dumps)."""
+    """Collects yt-dlp's console messages."""
 
     def __init__(self):
         self.lines = []
@@ -179,13 +171,11 @@ def _walk(obj):
         for v in obj.values():
             yield from _walk(v)
     elif isinstance(obj, list):
-        for v in obj:
-            yield from _walk(v)
+        yield from _walk(v)
 
 
 def _best_candidate(d):
-    """Best (largest, uncropped) image URL among every variant listed on a media node."""
-    variants = []  # (url, width, height)
+    variants = []
     if d.get('display_url'):
         variants.append((d['display_url'], None, None))
     for c in (d.get('image_versions2') or {}).get('candidates') or []:
@@ -200,7 +190,6 @@ def _best_candidate(d):
 
 
 def _media_from_node(m):
-    """Image URLs belonging to ONE post node (single photo or carousel)."""
     urls = []
     carousel = m.get('carousel_media')
     if isinstance(carousel, list) and carousel:
@@ -222,21 +211,18 @@ def _media_from_node(m):
 
 
 def find_media_for_code(obj, code):
-    """Find the node whose shortcode matches THIS post and return only its images.
-    This stops related / suggested posts in the same response from leaking in."""
     best = []
     for d in _walk(obj):
         if code in (d.get('shortcode'), d.get('code')) and any(
             k in d for k in ('display_url', 'image_versions2', 'carousel_media', 'edge_sidecar_to_children')
         ):
             urls = _media_from_node(d)
-            if len(urls) > len(best):  # the full post node has more images than a stub of it
+            if len(urls) > len(best):
                 best = urls
     return best
 
 
 def _balanced(text, start):
-    """Return the JSON object/array that opens at text[start] (string-aware brace matching)."""
     close = '}' if text[start] == '{' else ']'
     depth, in_str, esc = 0, False, False
     for i in range(start, len(text)):
@@ -260,14 +246,12 @@ def _balanced(text, start):
 
 
 def find_sidecar_in_text(text, code):
-    """Carousel images from an HTML page: find the 'children' block that sits closest to
-    this post's shortcode, so suggested/related carousels on the page are not mixed in."""
     text = normalize(text)
     anchors = [m.start() for m in re.finditer(r'"(?:shortcode|code)"\s*:\s*"' + re.escape(code) + '"', text)]
     if not anchors:
         return []
 
-    candidates = []  # (distance_to_shortcode, urls)
+    candidates = []
     for key, opener in (('"edge_sidecar_to_children"', '{'), ('"carousel_media"', '[')):
         for m in re.finditer(key, text):
             start = text.find(opener, m.end())
@@ -293,10 +277,6 @@ def find_sidecar_in_text(text, code):
 
 
 def extract_images_via_ytdlp_dump(url, post_code):
-    """yt-dlp reaches Instagram fine from this server but refuses photo-only posts
-    ("There is no video in this post"). Re-run it with page dumping on, capture
-    every page/JSON response it downloaded, and read the image URLs from those.
-    Returns (image_urls, diagnostics_string)."""
     logger = CaptureLogger()
     opts = {
         'quiet': True,
@@ -310,7 +290,7 @@ def extract_images_via_ytdlp_dump(url, post_code):
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=False)
     except Exception:
-        pass  # expected: "There is no video in this post"
+        pass
 
     pages, total = 0, 0
     json_images = []
@@ -337,7 +317,7 @@ def extract_images_via_ytdlp_dump(url, post_code):
             if not html_sidecar:
                 html_sidecar = find_sidecar_in_text(text, post_code)
             if not html_first:
-                html_first = find_post_images(text)[:1]  # single photo: never related posts
+                html_first = find_post_images(text)[:1]
 
     if len(html_sidecar) > len(json_images):
         images, mode = html_sidecar, 'html-carousel'
@@ -349,6 +329,62 @@ def extract_images_via_ytdlp_dump(url, post_code):
 
     return images, (f'ytdlp-dump: lines={len(logger.lines)} pages={pages} bytes={total} '
                     f'mode={mode} images={len(images)} first_stp={describe_url(images[0] if images else None)}')
+
+
+# ---------------------------------------------------------------------------
+# TikTok Extraction Feature
+# ---------------------------------------------------------------------------
+def extract_tiktok(url):
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            title = info.get('title', '')
+            thumbnail = info.get('thumbnail', '')
+            audio_url = None
+            items = []
+
+            # Check if it's a photo/slideshow collection or single video
+            entries = info.get('entries')
+            if entries:
+                for entry in entries:
+                    if not entry:
+                        continue
+                    img_url = entry.get('url') or entry.get('thumbnail')
+                    if img_url:
+                        items.append({'url': img_url, 'type': 'image'})
+            else:
+                video_url = info.get('url')
+                if video_url:
+                    items.append({'url': video_url, 'type': 'video'})
+                elif thumbnail:
+                    items.append({'url': thumbnail, 'type': 'image'})
+
+            # Extract background music / audio track if available
+            formats = info.get('formats', [])
+            for f in formats:
+                if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url'):
+                    audio_url = f['url']
+                    break
+
+            if not items:
+                return {'error': 'Could not extract media links from TikTok URL.'}
+
+            return {
+                'items': items,
+                'download_urls': [i['url'] for i in items],
+                'is_image': all(i['type'] == 'image' for i in items),
+                'title': title,
+                'thumbnail': thumbnail,
+                'audio_url': audio_url
+            }
+    except Exception as e:
+        return {'error': 'TikTok extraction error: ' + str(e)[:200]}
 
 
 class handler(BaseHTTPRequestHandler):
@@ -365,7 +401,7 @@ class handler(BaseHTTPRequestHandler):
                 parsed_url = urllib.parse.urlparse(self.path)
                 query_params = urllib.parse.parse_qs(parsed_url.query)
                 target_url = query_params.get('url', [None])[0]
-                filename = query_params.get('filename', ['instagram-media'])[0].replace('"', '')
+                filename = query_params.get('filename', ['media-download'])[0].replace('"', '')
 
                 if not target_url or not host_allowed(target_url):
                     return self._json(400, {'error': 'Invalid or disallowed URL'})
@@ -397,8 +433,19 @@ class handler(BaseHTTPRequestHandler):
             data = json.loads(body)
             raw_url = data.get('url', '')
 
-            if not raw_url or 'instagram.com' not in raw_url:
-                return self._json(400, {'error': 'Invalid Instagram URL'})
+            if not raw_url:
+                return self._json(400, {'error': 'Invalid or empty URL'})
+
+            # ---- TikTok Route ----
+            if 'tiktok.com' in raw_url:
+                result = extract_tiktok(raw_url)
+                if 'error' in result:
+                    return self._json(500, {'error': result['error']})
+                return self._json(200, result)
+
+            # ---- Instagram Route (Unchanged) ----
+            if 'instagram.com' not in raw_url:
+                return self._json(400, {'error': 'Invalid social media URL'})
 
             clean_url = raw_url.split('?')[0]
             match_post = re.search(
@@ -428,7 +475,7 @@ class handler(BaseHTTPRequestHandler):
 
             # Step 1: yt-dlp (works for reels / video posts)
             info = None
-            for attempt in range(2 if is_reel else 1):  # reels: retry once on a flaky response
+            for attempt in range(2 if is_reel else 1):
                 try:
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(clean_url, download=False)
@@ -462,14 +509,12 @@ class handler(BaseHTTPRequestHandler):
             except Exception as ydl_ex:
                 last_error = str(ydl_ex)
 
-            # Step 2: fallback for photo-only posts (yt-dlp can't handle them)
-            # Never used for reels: a failed reel must not turn into photos of other posts.
+            # Step 2: fallback for photo-only posts
             if not media_urls and post_code and not is_reel:
                 media_urls, diag = extract_images_via_ytdlp_dump(clean_url, post_code)
                 is_image = True
 
-            # Step 3: last resort, scrape Instagram's embed pages directly (first image only,
-            # so related posts on the page are never returned)
+            # Step 3: last resort embed scrape
             if not media_urls and post_code and not is_reel:
                 found, diag2 = extract_images_fallback(post_code)
                 media_urls = found
@@ -477,7 +522,7 @@ class handler(BaseHTTPRequestHandler):
                 is_image = True
 
             if media_urls:
-                cleaned_urls = list(dict.fromkeys(media_urls))  # dedupe, keep order
+                cleaned_urls = list(dict.fromkeys(media_urls))
                 info_text = diag
                 if is_image:
                     info_text += f' | probe_first={probe(cleaned_urls[0])}'
@@ -489,8 +534,6 @@ class handler(BaseHTTPRequestHandler):
             if diag:
                 details += (' || ' if details else '') + diag[:400]
 
-            # Details go inside the error text so your existing page shows them
-            # without any change to functions.php. Remove this once it works.
             self._json(500, {
                 'error': 'Could not extract media. Please check if the post is public. [DEBUG: '
                          + (details or 'no details') + ']',
@@ -506,4 +549,3 @@ class handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
-
