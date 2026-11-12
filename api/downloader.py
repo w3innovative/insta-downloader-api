@@ -1308,14 +1308,47 @@ class handler(BaseHTTPRequestHandler):
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
 
-            # ---- YouTube Route ----
-            if is_youtube_url(raw_url):
+           # ---- YouTube Route (via Public Piped API) ----
+            if 'youtube.com' in raw_url or 'youtu.be' in raw_url:
                 try:
-                    mode = data.get('mode', 'video')
-                    result = extract_youtube(raw_url, mode=mode)
-                    if 'error' in result:
-                        return self._json(500, {'error': result['error']})
-                    return self._json(200, result)
+                    vid = yt_video_id(raw_url)
+                    if not vid:
+                        return self._json(400, {'error': 'Invalid YouTube URL'})
+
+                    # Query a reliable public Piped instance API
+                    piped_api_url = f"https://pipedapi.kavin.rocks/streams/{vid}"
+                    req = urllib.request.Request(piped_api_url, headers={'User-Agent': UA})
+                    
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        data = json.loads(resp.read().decode('utf-8', errors='ignore'))
+                        
+                        title = data.get('title', 'YouTube Video')
+                        thumbnail = data.get('thumbnailUrl', '')
+                        
+                        # Grab the best available video stream URL
+                        video_streams = data.get('videoStreams', [])
+                        stream_url = None
+                        for s in video_streams:
+                            if s.get('url') and s.get('videoOnly') == False:
+                                stream_url = s.get('url')
+                                break
+                        if not stream_url and video_streams:
+                            stream_url = video_streams[0].get('url')
+
+                        # Grab audio stream for MP3 mode if requested
+                        audio_streams = data.get('audioStreams', [])
+                        audio_url = audio_streams[0].get('url') if audio_streams else None
+
+                        if not stream_url:
+                            return self._json(500, {'error': 'Could not extract streams from YouTube.'})
+
+                        return self._json(200, {
+                            'download_urls': [stream_url],
+                            'is_image': False,
+                            'title': title,
+                            'thumbnail': thumbnail,
+                            'audio_url': audio_url
+                        })
                 except Exception as yt_ex:
                     return self._json(500, {'error': 'YouTube extraction error: ' + str(yt_ex)[:200]})
 
