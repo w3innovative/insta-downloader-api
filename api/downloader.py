@@ -1025,6 +1025,15 @@ def extract_youtube(raw_url, mode='video'):
         return {'video_id': vid, 'title': title, 'thumbnail': thumbs[0]['url'], 'thumbnails': thumbs,
                 'download_urls': [t['url'] for t in thumbs], 'is_image': True}
 
+    if cobalt_instances():
+        # Cobalt makes the files; here only the preview info is needed (works even when YouTube blocks yt-dlp)
+        return {
+            'video_id': vid, 'title': title[:150], 'thumbnail': (thumbs[0]['url'] if thumbs else ''),
+            'thumbnails': thumbs, 'cobalt': True, 'download_urls': [], 'is_image': False,
+            'qualities': [{'label': (q + 'p'), 'q': q} for q in ('1080', '720', '480', '360')],
+            'audio': True,
+        }
+
     attempts = [None, ['android_vr'], ['tv'], ['mweb']]
     notes, info, found = [], None, None
     for clients in attempts:
@@ -1068,6 +1077,67 @@ def extract_youtube(raw_url, mode='video'):
         'download_urls': [best] if best else [],
         'is_image': False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Cobalt gateway (optional). Set the COBALT_API_URL environment variable in Vercel to the address of
+# a Cobalt instance (several can be given, separated by commas; COBALT_API_KEY is optional).
+# When it is set, YouTube video / MP3 downloads are requested from Cobalt instead of yt-dlp.
+# ---------------------------------------------------------------------------
+COBALT_QUALITIES = ('144', '240', '360', '480', '720', '1080', '1440', '2160')
+
+
+def cobalt_instances():
+    return [u.strip().rstrip('/') for u in os.environ.get('COBALT_API_URL', '').split(',') if u.strip()]
+
+
+def cobalt_get(yt_url, kind, quality):
+    """Asks Cobalt for one file. Returns ({'url','filename'}, notes)."""
+    quality = quality if quality in COBALT_QUALITIES else '720'
+    payload = {
+        'url': yt_url,
+        'downloadMode': 'audio' if kind == 'audio' else 'auto',
+        'audioFormat': 'mp3',
+        'audioBitrate': '128',
+        'videoQuality': quality,
+        'youtubeVideoCodec': 'h264',
+        'filenameStyle': 'basic',
+    }
+    headers = {'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': UA}
+    key = os.environ.get('COBALT_API_KEY', '').strip()
+    if key:
+        headers['Authorization'] = 'Api-Key ' + key
+
+    notes = []
+    for base in cobalt_instances():
+        host = urllib.parse.urlparse(base).hostname or base
+        try:
+            req = urllib.request.Request(base + '/', data=json.dumps(payload).encode('utf-8'),
+                                         headers=headers, method='POST')
+            try:
+                with urllib.request.urlopen(req, timeout=28) as r:
+                    body = json.loads(r.read().decode('utf-8', errors='ignore'))
+            except urllib.error.HTTPError as e:
+                try:
+                    body = json.loads(e.read().decode('utf-8', errors='ignore'))
+                except Exception:
+                    notes.append(f'{host}: http {e.code}')
+                    continue
+            status = body.get('status')
+            if status in ('tunnel', 'redirect', 'stream') and body.get('url'):
+                return {'url': body['url'], 'filename': body.get('filename') or ''}, notes
+            if status == 'picker':
+                for it in body.get('picker') or []:
+                    if it.get('url'):
+                        return {'url': it['url'], 'filename': ''}, notes
+                if body.get('audio'):
+                    return {'url': body['audio'], 'filename': ''}, notes
+            err = body.get('error')
+            code = err.get('code') if isinstance(err, dict) else err
+            notes.append(f'{host}: {code or status or "no result"}')
+        except Exception as e:
+            notes.append(f'{host}: ' + re.sub(r'\s+', ' ', str(e))[:80])
+    return None, notes
 
 
 def ffmpeg_path():
@@ -1240,6 +1310,18 @@ class handler(BaseHTTPRequestHandler):
 
             # ---- YouTube Route ----
             if is_youtube_url(raw_url):
+                if str(data.get('mode') or '') == 'cobalt_get':
+                    vid = yt_video_id(raw_url)
+                    if not vid or not cobalt_instances():
+                        return self._json(400, {'error': 'Could not find a video in this link.'})
+                    got, notes = cobalt_get(f'https://www.youtube.com/watch?v={vid}',
+                                            'audio' if data.get('kind') == 'audio' else 'video',
+                                            str(data.get('quality') or ''))
+                    if not got:
+                        return self._json(500, {'error': 'The download service could not prepare this file. '
+                                                         'Please try again or pick another quality. [DEBUG: '
+                                                         + ' | '.join(notes)[:300] + ']'})
+                    return self._json(200, got)
                 result = extract_youtube(raw_url, str(data.get('mode') or 'video'))
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
