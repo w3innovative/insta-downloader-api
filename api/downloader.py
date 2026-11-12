@@ -1202,18 +1202,23 @@ class handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if '?url=' in self.path:
-            target_url = None
-            req_headers = {}
             try:
                 parsed_url = urllib.parse.urlparse(self.path)
                 query_params = urllib.parse.parse_qs(parsed_url.query)
                 target_url = query_params.get('url', [None])[0]
                 filename = query_params.get('filename', ['media-download'])[0].replace('"', '')
-                inline = query_params.get('inline', ['0'])[0] == '1'  # 1 = play in the page, 0 = download
-                audio = query_params.get('audio', ['0'])[0] == '1'    # 1 = audio file: fix its type and extension
 
                 if not target_url or not host_allowed(target_url):
                     return self._json(400, {'error': 'Invalid or disallowed URL'})
+
+                # Bypass Vercel proxy block for YouTube streams by redirecting directly
+                parsed_target = urllib.parse.urlparse(target_url)
+                if 'googlevideo.com' in (parsed_target.hostname or '').lower():
+                    self.send_response(302)
+                    self.send_header('Location', target_url)
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    return
 
                 req_headers = proxy_request_headers(
                     target_url, query_params.get('h', [None])[0], self.headers.get('Range'))
