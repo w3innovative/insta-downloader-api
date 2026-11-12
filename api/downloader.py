@@ -816,6 +816,66 @@ def fb_open_graph_media(url):
     return {'diag': f'og: http={status} bytes={len(page)} images=0 video=0'}
 
 
+def _fb_page_photos(page):
+    """Photo links inside an embed / mobile page (profile pictures, icons and tiny thumbnails skipped)."""
+    text = normalize(page)
+    out = []
+    for u in re.findall(r'https?://[^\s"\'<>\\]+', text):
+        host = (urllib.parse.urlparse(u).hostname or '').lower()
+        if not (host.endswith('fbcdn.net') or host.startswith('scontent')):
+            continue
+        if re.search(r'/rsrc\.php|emoji|static\.|/safe_image|[/_]p\d{2,3}x\d{2,3}|s\d{2,3}x\d{2,3}|\.30808-1/', u):
+            continue
+        if not re.search(r'\.(?:jpg|jpeg|png|webp)(?:\?|$)', urllib.parse.urlparse(u).path + '?', re.I):
+            continue
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def fb_photo_media(url):
+    """Photos: several ways of asking Facebook, because it shows a login page to some of them."""
+    p = urllib.parse.urlparse(url)
+    q = urllib.parse.parse_qs(p.query)
+    fbid = (q.get('fbid') or [''])[0]
+    if not fbid:
+        m = re.search(r'/(?:photos?|posts|permalink)[^?]*?/(\d{8,})', p.path)
+        fbid = m.group(1) if m else ''
+    canonical = f'https://www.facebook.com/photo.php?fbid={fbid}' if fbid else ''
+    enc = urllib.parse.quote(url, safe='')
+
+    attempts = [('og', url, FB_UA, 'og')]
+    if fbid:
+        attempts.append(('og-m', f'https://m.facebook.com/photo.php?fbid={fbid}', FB_UA, 'og'))
+        attempts.append(('og-canon', canonical, FB_UA, 'og'))
+    attempts.append(('embed', f'https://www.facebook.com/plugins/post.php?href={enc}&show_text=true&width=500', UA, 'page'))
+    if canonical:
+        enc2 = urllib.parse.quote(canonical, safe='')
+        attempts.append(('embed2', f'https://www.facebook.com/plugins/post.php?href={enc2}&show_text=true&width=500', UA, 'page'))
+    if fbid:
+        attempts.append(('mbasic', f'https://mbasic.facebook.com/photo.php?fbid={fbid}', UA, 'page'))
+
+    diag = []
+    for name, target, ua, mode in attempts:
+        status, final, page = fb_fetch(target, ua)
+        wall = '/login' in final or 'login.php' in final
+        if status != 200 or not page or wall:
+            diag.append(f'{name}: http={status}{" login" if wall else ""}')
+            continue
+        title = (_og_values(page, 'og:title') or [''])[0]
+        images = []
+        for v in _og_values(page, 'og:image'):
+            host = (urllib.parse.urlparse(v).hostname or '').lower()
+            if host.endswith('fbcdn.net') and '/rsrc.php' not in v and v not in images:
+                images.append(v)
+        if not images and mode == 'page':
+            images = _fb_page_photos(page)[:12]
+        diag.append(f'{name}: http={status} images={len(images)}')
+        if images:
+            return _fb_result([{'url': u, 'type': 'image'} for u in images], title, images[0])
+    return {'diag': 'photo: ' + '; '.join(diag)}
+
+
 def extract_facebook(raw_url):
     url = resolve_fb_url(raw_url.strip())
 
@@ -832,7 +892,7 @@ def extract_facebook(raw_url):
         except Exception as e:
             notes.append('yt-dlp: ' + re.sub(r'\s+', ' ', str(e))[:180])
 
-    og = fb_open_graph_media(url)
+    og = fb_photo_media(url) if fb_is_photo(url) else fb_open_graph_media(url)
     if og.get('items'):
         return og
     if og.get('diag'):
