@@ -413,7 +413,13 @@ class handler(BaseHTTPRequestHandler):
                 if not target_url or not host_allowed(target_url):
                     return self._json(400, {'error': 'Invalid or disallowed URL'})
 
-                req = urllib.request.Request(target_url, headers={'User-Agent': UA})
+                headers = {
+                    'User-Agent': UA,
+                    'Referer': 'https://www.tiktok.com/',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                }
+                req = urllib.request.Request(target_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=25) as remote_file:
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
                     self.send_response(200)
