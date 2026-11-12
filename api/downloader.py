@@ -4,6 +4,9 @@ import http.cookiejar
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import html as htmllib
 from types import SimpleNamespace
 import urllib.error
@@ -848,6 +851,12 @@ def fb_photo_media(url):
     if fbid:
         attempts.append(('og-m', f'https://m.facebook.com/photo.php?fbid={fbid}', FB_UA, 'og'))
         attempts.append(('og-canon', canonical, FB_UA, 'og'))
+    for bot, bua in (('whatsapp', 'WhatsApp/2.23.20.0 A'), ('twitter', 'Twitterbot/1.0'),
+                     ('slack', 'Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)'),
+                     ('telegram', 'TelegramBot (like TwitterBot)'),
+                     ('google', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)')):
+        attempts.append((bot, canonical or url, bua, 'og'))
+        attempts.append((bot + '-m', f'https://m.facebook.com/photo.php?fbid={fbid}' if fbid else url, bua, 'og'))
     attempts.append(('embed', f'https://www.facebook.com/plugins/post.php?href={enc}&show_text=true&width=500', UA, 'page'))
     if canonical:
         enc2 = urllib.parse.quote(canonical, safe='')
@@ -906,6 +915,40 @@ def extract_facebook(raw_url):
     return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
 
 
+def ffmpeg_path():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which('ffmpeg')
+
+
+def convert_to_mp3(req_headers, target_url, max_in=40_000_000, max_out=4_200_000):
+    """Downloads an audio file and re-encodes it to a real MP3. Returns bytes, or None when ffmpeg
+    is missing / fails / the result would be too big for a Vercel response (caller falls back)."""
+    exe = ffmpeg_path()
+    if not exe:
+        return None
+    try:
+        h = {k: v for k, v in req_headers.items() if k.lower() != 'range'}
+        with urllib.request.urlopen(urllib.request.Request(target_url, headers=h), timeout=25) as r:
+            data = r.read(max_in + 1)
+        if len(data) > max_in:
+            return None
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, 'in.bin')
+            with open(src, 'wb') as f:
+                f.write(data)
+            out = subprocess.run(
+                [exe, '-v', 'error', '-i', src, '-vn', '-codec:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1'],
+                capture_output=True, timeout=40)
+        if out.returncode != 0 or not out.stdout or len(out.stdout) > max_out:
+            return None
+        return out.stdout
+    except Exception:
+        return None
+
+
 class handler(BaseHTTPRequestHandler):
     def _json(self, code, payload):
         self.send_response(code)
@@ -931,6 +974,20 @@ class handler(BaseHTTPRequestHandler):
 
                 req_headers = proxy_request_headers(
                     target_url, query_params.get('h', [None])[0], self.headers.get('Range'))
+
+                # Facebook audio: convert to a real MP3 when ffmpeg is available (otherwise falls through to M4A)
+                if query_params.get('mp3', ['0'])[0] == '1':
+                    mp3 = convert_to_mp3(req_headers, target_url)
+                    if mp3:
+                        name = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp3'
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'audio/mpeg')
+                        self.send_header('Content-Disposition', f'attachment; filename="{name}"')
+                        self.send_header('Content-Length', str(len(mp3)))
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.end_headers()
+                        self.wfile.write(mp3)
+                        return
 
                 req = urllib.request.Request(target_url, headers=req_headers)
                 with urllib.request.urlopen(req, timeout=25) as remote_file:
