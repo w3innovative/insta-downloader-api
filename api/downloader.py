@@ -30,7 +30,9 @@ ALLOWED_PROXY_SUFFIXES = (
     'byteoversea.com',
     'ibyteimg.com',
     'ibytedtos.com',
-    'muscdn.com'
+    'muscdn.com',
+    'googlevideo.com',
+    'ytimg.com'
 )
 
 
@@ -915,6 +917,159 @@ def extract_facebook(raw_url):
     return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
 
 
+# ---------------------------------------------------------------------------
+# YouTube
+# Videos / Shorts / audio come from yt-dlp (only ready-made files that already contain picture and
+# sound, because Vercel has no room to merge separate streams). Thumbnails need no yt-dlp at all.
+# ---------------------------------------------------------------------------
+def is_youtube_url(raw_url):
+    try:
+        p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+        host = (p.hostname or '').lower()
+    except Exception:
+        return False
+    return any(host == d or host.endswith('.' + d) for d in ('youtube.com', 'youtu.be', 'youtube-nocookie.com'))
+
+
+def yt_video_id(raw_url):
+    p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+    host = (p.hostname or '').lower()
+    if host == 'youtu.be':
+        m = re.match(r'/([\w\-]{11})', p.path)
+        return m.group(1) if m else None
+    m = re.match(r'/(?:shorts|live|embed|v)/([\w\-]{11})', p.path)
+    if m:
+        return m.group(1)
+    v = urllib.parse.parse_qs(p.query).get('v', [''])[0]
+    return v if re.fullmatch(r'[\w\-]{11}', v or '') else None
+
+
+def yt_head_ok(url):
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': UA}, method='HEAD')
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def yt_oembed_title(vid):
+    try:
+        u = 'https://www.youtube.com/oembed?format=json&url=' + urllib.parse.quote(
+            f'https://www.youtube.com/watch?v={vid}', safe='')
+        req = urllib.request.Request(u, headers={'User-Agent': UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return (json.loads(r.read().decode('utf-8', errors='ignore')).get('title') or '').strip()
+    except Exception:
+        return ''
+
+
+def yt_thumbnails(vid):
+    """Thumbnail sizes that exist for this video, largest first."""
+    sizes = [('maxresdefault', 'Max quality (1280x720)'), ('sddefault', 'HD (640x480)'),
+             ('hqdefault', 'Standard (480x360)')]
+    out = []
+    for name, label in sizes:
+        u = f'https://i.ytimg.com/vi/{vid}/{name}.jpg'
+        if yt_head_ok(u):
+            out.append({'label': label, 'url': u})
+    return out
+
+
+def yt_token(headers):
+    h = {k: v for k, v in (headers or {}).items() if k in FORWARDED_HEADERS and isinstance(v, str)}
+    h.setdefault('User-Agent', UA)
+    h['Referer'] = 'https://www.youtube.com/'
+    h.pop('Cookie', None)
+    raw = json.dumps(h, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def yt_pick_formats(info):
+    """(qualities, audio_url, headers). qualities = [{'label','url','size'}] tallest first."""
+    prog, audio, headers = {}, [], None
+    for f in info.get('formats') or []:
+        url = f.get('url')
+        if not url or str(f.get('protocol') or '') not in ('https', 'http'):
+            continue
+        v, a = f.get('vcodec'), f.get('acodec')
+        height = f.get('height') or 0
+        size = f.get('filesize') or f.get('filesize_approx') or 0
+        if v not in (None, 'none') and a not in (None, 'none'):
+            if f.get('ext') != 'mp4':
+                continue
+            cur = prog.get(height)
+            if not cur or (f.get('tbr') or 0) > cur['tbr']:
+                prog[height] = {'url': url, 'tbr': f.get('tbr') or 0, 'size': size}
+                headers = headers or f.get('http_headers')
+        elif v in (None, 'none') and a not in (None, 'none'):
+            audio.append((1 if f.get('ext') == 'm4a' else 0, f.get('abr') or f.get('tbr') or 0, url))
+            headers = headers or f.get('http_headers')
+    qualities = [{'label': f'{h}p' if h else 'Video', 'url': d['url'], 'size': d['size']}
+                 for h, d in sorted(prog.items(), reverse=True)]
+    audio.sort(reverse=True)
+    return qualities, (audio[0][2] if audio else None), (headers or info.get('http_headers'))
+
+
+def extract_youtube(raw_url, mode='video'):
+    vid = yt_video_id(raw_url)
+    if not vid:
+        return {'error': 'Could not find a video in this link. Please paste a full YouTube video or Shorts link.'}
+
+    title = yt_oembed_title(vid)
+    thumbs = yt_thumbnails(vid)
+
+    if mode == 'thumbnail':
+        if not thumbs:
+            return {'error': 'No thumbnail was found for this video. It may be private or deleted.'}
+        return {'video_id': vid, 'title': title, 'thumbnail': thumbs[0]['url'], 'thumbnails': thumbs,
+                'download_urls': [t['url'] for t in thumbs], 'is_image': True}
+
+    attempts = [None, ['android_vr'], ['tv'], ['mweb']]
+    notes, info, found = [], None, None
+    for clients in attempts:
+        opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'noplaylist': True}
+        if clients:
+            opts['extractor_args'] = {'youtube': {'player_client': clients}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f'https://www.youtube.com/watch?v={vid}', download=False)
+            if info:
+                qualities, audio_url, headers = yt_pick_formats(info)
+                if qualities or audio_url:
+                    found = (qualities, audio_url, headers)
+                    break
+                notes.append(f'{clients or "default"}: no usable formats')
+        except Exception as e:
+            notes.append(f'{clients or "default"}: ' + re.sub(r'\s+', ' ', str(e))[:110])
+
+    if not found:
+        joined = ' | '.join(notes)
+        if re.search(r'sign in|not a bot|confirm you', joined, re.I):
+            msg = ('YouTube is asking this server to prove it is not a bot, so the video cannot be fetched '
+                   'right now. The Thumbnail tab still works.')
+        elif re.search(r'private|unavailable|removed|members', joined, re.I):
+            msg = 'This video is private, removed, or not available to download.'
+        else:
+            msg = 'Could not get this YouTube video. It may be restricted, or YouTube may be blocking the request.'
+        return {'error': msg + ' [DEBUG: ' + joined[:380] + ']'}
+
+    qualities, audio_url, headers = found
+    best = qualities[0]['url'] if qualities else None
+    return {
+        'video_id': vid,
+        'title': (title or info.get('title') or '')[:150],
+        'duration': info.get('duration'),
+        'thumbnail': (thumbs[0]['url'] if thumbs else info.get('thumbnail') or ''),
+        'thumbnails': thumbs,
+        'qualities': qualities,
+        'audio_url': audio_url,
+        'h': yt_token(headers),
+        'download_urls': [best] if best else [],
+        'is_image': False,
+    }
+
+
 def ffmpeg_path():
     try:
         import imageio_ffmpeg
@@ -923,7 +1078,26 @@ def ffmpeg_path():
         return shutil.which('ffmpeg')
 
 
-def convert_to_mp3(req_headers, target_url, max_in=40_000_000, max_out=4_200_000):
+def fetch_all(target_url, headers, max_in):
+    """Whole file as bytes. YouTube's servers slow down plain downloads, so those are fetched in
+    10 MB pieces with &range=, the way yt-dlp does it."""
+    host = (urllib.parse.urlparse(target_url).hostname or '').lower()
+    if not host.endswith('googlevideo.com'):
+        with urllib.request.urlopen(urllib.request.Request(target_url, headers=headers), timeout=25) as r:
+            return r.read(max_in + 1)
+    data, start, step = b'', 0, 10 * 1024 * 1024
+    while len(data) <= max_in:
+        u = f'{target_url}&range={start}-{start + step - 1}'
+        with urllib.request.urlopen(urllib.request.Request(u, headers=headers), timeout=25) as r:
+            part = r.read()
+        data += part
+        if len(part) < step:
+            break
+        start += step
+    return data
+
+
+def convert_to_mp3(req_headers, target_url, max_in=40_000_000, max_out=4_200_000, bitrate=128):
     """Downloads an audio file and re-encodes it to a real MP3. Returns bytes, or None when ffmpeg
     is missing / fails / the result would be too big for a Vercel response (caller falls back)."""
     exe = ffmpeg_path()
@@ -931,8 +1105,7 @@ def convert_to_mp3(req_headers, target_url, max_in=40_000_000, max_out=4_200_000
         return None
     try:
         h = {k: v for k, v in req_headers.items() if k.lower() != 'range'}
-        with urllib.request.urlopen(urllib.request.Request(target_url, headers=h), timeout=25) as r:
-            data = r.read(max_in + 1)
+        data = fetch_all(target_url, h, max_in)
         if len(data) > max_in:
             return None
         with tempfile.TemporaryDirectory() as tmp:
@@ -940,7 +1113,7 @@ def convert_to_mp3(req_headers, target_url, max_in=40_000_000, max_out=4_200_000
             with open(src, 'wb') as f:
                 f.write(data)
             out = subprocess.run(
-                [exe, '-v', 'error', '-i', src, '-vn', '-codec:a', 'libmp3lame', '-b:a', '128k', '-f', 'mp3', 'pipe:1'],
+                [exe, '-v', 'error', '-i', src, '-vn', '-codec:a', 'libmp3lame', '-b:a', f'{bitrate}k', '-f', 'mp3', 'pipe:1'],
                 capture_output=True, timeout=40)
         if out.returncode != 0 or not out.stdout or len(out.stdout) > max_out:
             return None
@@ -977,7 +1150,11 @@ class handler(BaseHTTPRequestHandler):
 
                 # Facebook audio: convert to a real MP3 when ffmpeg is available (otherwise falls through to M4A)
                 if query_params.get('mp3', ['0'])[0] == '1':
-                    mp3 = convert_to_mp3(req_headers, target_url)
+                    try:
+                        br = int(query_params.get('br', ['128'])[0])
+                    except ValueError:
+                        br = 128
+                    mp3 = convert_to_mp3(req_headers, target_url, bitrate=br if 32 <= br <= 128 else 128)
                     if mp3:
                         name = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp3'
                         self.send_response(200)
@@ -1057,6 +1234,13 @@ class handler(BaseHTTPRequestHandler):
             # ---- Facebook Route ----
             if is_facebook_url(raw_url):
                 result = extract_facebook(raw_url)
+                if 'error' in result:
+                    return self._json(500, {'error': result['error']})
+                return self._json(200, result)
+
+            # ---- YouTube Route ----
+            if is_youtube_url(raw_url):
+                result = extract_youtube(raw_url, str(data.get('mode') or 'video'))
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
