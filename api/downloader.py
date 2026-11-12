@@ -374,6 +374,16 @@ def make_download_token(ydl, media_url, base_headers):
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
+def sniff_audio(first_bytes):
+    """'mp3' for a real MP3 file, 'm4a' for audio inside an MP4 container, else None."""
+    b = first_bytes or b''
+    if b[:3] == b'ID3' or (len(b) > 1 and b[0] == 0xFF and (b[1] & 0xE0) == 0xE0):
+        return 'mp3'
+    if len(b) >= 8 and b[4:8] == b'ftyp':
+        return 'm4a'
+    return None
+
+
 def proxy_request_headers(target_url, h_param, client_range):
     """Headers the proxy sends to the CDN, plus the token's headers if given."""
     host = (urllib.parse.urlparse(target_url or '').hostname or '').lower()
@@ -648,6 +658,7 @@ class handler(BaseHTTPRequestHandler):
                 target_url = query_params.get('url', [None])[0]
                 filename = query_params.get('filename', ['media-download'])[0].replace('"', '')
                 inline = query_params.get('inline', ['0'])[0] == '1'  # 1 = play in the page, 0 = download
+                audio = query_params.get('audio', ['0'])[0] == '1'    # 1 = audio file: fix its type and extension
 
                 if not target_url or not host_allowed(target_url):
                     return self._json(400, {'error': 'Invalid or disallowed URL'})
@@ -658,6 +669,17 @@ class handler(BaseHTTPRequestHandler):
                 req = urllib.request.Request(target_url, headers=req_headers)
                 with urllib.request.urlopen(req, timeout=25) as remote_file:
                     content_type = remote_file.headers.get('Content-Type', 'application/octet-stream')
+
+                    # TikTok's audio is usually AAC inside an MP4 container, not a real MP3. Look at the
+                    # first bytes and label it correctly, so phones list it under Music, not Videos.
+                    first = b''
+                    if audio and remote_file.status == 200:
+                        first = remote_file.read(8192)
+                        kind = sniff_audio(first)
+                        if kind:
+                            content_type = 'audio/mp4' if kind == 'm4a' else 'audio/mpeg'
+                            filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.' + kind
+
                     self.send_response(remote_file.status)
                     self.send_header('Content-Type', content_type)
                     self.send_header('Content-Disposition',
@@ -672,6 +694,8 @@ class handler(BaseHTTPRequestHandler):
 
                     self.end_headers()
 
+                    if first:
+                        self.wfile.write(first)
                     while True:
                         chunk = remote_file.read(8192)
                         if not chunk:
