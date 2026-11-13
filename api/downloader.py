@@ -1386,12 +1386,24 @@ def extract_vimeo(raw_url, mode='video'):
     return res
 
 
+FFMPEG_NOTE = ''
+
+
 def ffmpeg_path():
+    """Path of an ffmpeg program, or None. The reason is kept in FFMPEG_NOTE for error messages."""
+    global FFMPEG_NOTE
     try:
         import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return shutil.which('ffmpeg')
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            return exe
+        FFMPEG_NOTE = 'imageio_ffmpeg: binary file missing'
+    except Exception as e:
+        FFMPEG_NOTE = 'imageio_ffmpeg: ' + re.sub(r'\s+', ' ', f'{type(e).__name__}: {e}')[:120]
+    exe = shutil.which('ffmpeg')
+    if not exe:
+        FFMPEG_NOTE = (FFMPEG_NOTE or 'no ffmpeg') + ' | system ffmpeg: not found'
+    return exe
 
 
 def convert_to_mp3(req_headers, target_url, max_in=40_000_000, max_out=4_200_000):
@@ -1436,7 +1448,8 @@ class handler(BaseHTTPRequestHandler):
             return self._json(400, {'error': 'Invalid download link'})
         exe = ffmpeg_path()
         if not exe:
-            return self._json(500, {'error': 'Video tools are not available on the server.'})
+            return self._json(500, {'error': 'Video tools are not available on the server. '
+                                             'Check that imageio-ffmpeg is listed in requirements.txt. [DEBUG: ' + FFMPEG_NOTE + ']'})
         filename = query_params.get('filename', ['vimeo-video'])[0].replace('"', '')
         want_mp3 = query_params.get('mp3', ['0'])[0] == '1'
         try:
