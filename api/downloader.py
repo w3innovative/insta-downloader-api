@@ -1358,7 +1358,10 @@ def vimeo_dash_playlist(cfg):
     why = ''
     for u in urls:
         try:
-            return u, json.loads(_vimeo_get(u).decode('utf-8', errors='ignore')), ''
+            pl, why = vimeo_load_dash(u)
+            if pl:
+                return u, pl, ''
+            return None, None, why
         except urllib.error.HTTPError as e:
             why = f'http {e.code} ' + (urllib.parse.urlparse(u).path.rsplit('/', 1)[-1])[:30]
         except Exception as e:
@@ -1366,9 +1369,57 @@ def vimeo_dash_playlist(cfg):
     return None, None, why
 
 
+def vimeo_parse_mpd(text):
+    """Standard DASH manifest -> ([(index, height, codecs, bandwidth)], has_audio, encrypted)."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(text)
+    def local(tag):
+        return tag.rsplit('}', 1)[-1]
+    vids, has_audio, drm, idx = [], False, False, 0
+    for el in root.iter():
+        if local(el.tag) == 'ContentProtection':
+            drm = True
+    for aset in root.iter():
+        if local(aset.tag) != 'AdaptationSet':
+            continue
+        kind = (aset.get('contentType') or aset.get('mimeType') or '').lower()
+        for rep in aset:
+            if local(rep.tag) != 'Representation':
+                continue
+            rkind = (rep.get('mimeType') or kind).lower()
+            if rkind.startswith('audio') or kind.startswith('audio'):
+                has_audio = True
+            elif rkind.startswith('video') or kind.startswith('video'):
+                codecs = rep.get('codecs') or aset.get('codecs') or ''
+                vids.append((idx, int(rep.get('height') or aset.get('height') or 0), codecs, int(rep.get('bandwidth') or 0)))
+                idx += 1
+    return vids, has_audio, drm
+
+
+def vimeo_load_dash(url):
+    """Loads a DASH manifest, either Vimeo's playlist.json or a standard .mpd. Returns (dict or None, reason)."""
+    text = _vimeo_get(url).decode('utf-8', errors='ignore')
+    head = text.lstrip()[:1]
+    if head == '{':
+        return json.loads(text), ''
+    if head == '<':
+        vids, has_audio, drm = vimeo_parse_mpd(text)
+        if drm:
+            return None, 'encrypted (DRM)'
+        if not vids:
+            return None, 'mpd without video'
+        return {'mpd': True, 'vids': vids, 'audio': has_audio}, ''
+    return None, 'unexpected reply: ' + repr(text[:50])
+
+
 def vimeo_dash_heights(pl):
     """{height: best H.264 stream} from a DASH playlist.json."""
     best = {}
+    if pl.get('mpd'):
+        for idx, h, codecs, bw in pl['vids']:
+            if h and not re.search(r'hvc1|hev1|av01|vp09|vp9', codecs) and (h not in best or bw > best[h]['bitrate']):
+                best[h] = {'idx': idx, 'bitrate': bw}
+        return best
     for st in pl.get('video') or []:
         codecs = str(st.get('codecs') or '')
         if re.search(r'hvc1|hev1|av01|vp09|vp9', codecs):
@@ -1458,7 +1509,10 @@ def extract_vimeo(raw_url, mode='video'):
 
     if not prog and not hls_v and not dash_streams:
         joined = ' | '.join(notes)
-        if re.search(r'http (?:401|403)|password|private|privacy|domain', joined, re.I) and not cfg_ok:
+        if 'encrypted (DRM)' in joined:
+            msg = ('This Vimeo video uses copy protection (DRM), so it cannot be downloaded. '
+                   'Only videos without protection can be saved.')
+        elif re.search(r'http (?:401|403)|password|private|privacy|domain', joined, re.I) and not cfg_ok:
             msg = 'This Vimeo video is private, password-protected or limited to certain websites, so it cannot be downloaded.'
         elif re.search(r'http 404|not found|does not exist|removed', joined, re.I):
             msg = 'This Vimeo video was not found. It may have been deleted.'
@@ -1569,7 +1623,43 @@ class handler(BaseHTTPRequestHandler):
                     # DASH: download the segments ourselves, ffmpeg only joins the two files
                     net = False
                     dash_url = tok['d']
-                    pl = json.loads(_vimeo_get(dash_url).decode('utf-8', errors='ignore'))
+                    pl, why = vimeo_load_dash(dash_url)
+                    if not pl:
+                        return self._json(502, {'error': 'Could not read the video list. ' + why})
+                    if pl.get('mpd'):
+                        # standard manifest: ffmpeg reads it directly
+                        streams = vimeo_dash_heights(pl)
+                        out = os.path.join(tmp, 'out.mp3' if want_mp3 else 'out.mp4')
+                        base = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', dash_url]
+                        if want_mp3:
+                            cmd = base + ['-map', '0:a:0', '-vn', '-codec:a', 'libmp3lame', '-b:a', f'{br}k', out]
+                            ctype = 'audio/mpeg'
+                            filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp3'
+                        else:
+                            if not streams:
+                                return self._json(502, {'error': 'No playable video stream was found.'})
+                            h = tok.get('q') if tok.get('q') in streams else max(streams)
+                            cmd = base + ['-map', f"0:v:{streams[h]['idx']}", '-map', '0:a:0?', '-c', 'copy',
+                                          '-movflags', '+faststart', out]
+                            ctype = 'video/mp4'
+                            filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp4'
+                        proc = subprocess.run(cmd, capture_output=True, timeout=55)
+                        if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+                            err = re.sub(r'\s+', ' ', proc.stderr.decode('utf-8', errors='ignore'))[:200]
+                            return self._json(502, {'error': 'Could not prepare the file. ' + err})
+                        self.send_response(200)
+                        self.send_header('Content-Type', ctype)
+                        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                        self.send_header('Content-Length', str(os.path.getsize(out)))
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.end_headers()
+                        with open(out, 'rb') as f:
+                            while True:
+                                chunk = f.read(65536)
+                                if not chunk:
+                                    break
+                                self.wfile.write(chunk)
+                        return
                     v_in = a_in = None
                     audio_streams = [x for x in (pl.get('audio') or []) if x.get('segments')]
                     audio_streams.sort(key=lambda x: (('mp4a' in str(x.get('codecs'))), x.get('bitrate') or 0), reverse=True)
