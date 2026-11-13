@@ -1734,21 +1734,46 @@ def rd_resolve(url):
     return url
 
 
+RD_UA_MOBILE = ('Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 '
+                '(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1')
+
+
+def _rd_post_from_json(text):
+    """Reddit JSON (listing of comments, or an info listing) / PullPush JSON -> post dict, or None."""
+    data = json.loads(text)
+    if isinstance(data, dict) and isinstance(data.get('data'), list):          # PullPush
+        post = data['data'][0] if data['data'] else None
+    elif isinstance(data, list):                                                # /comments/ID.json
+        post = data[0]['data']['children'][0]['data']
+    else:                                                                       # /api/info
+        post = data['data']['children'][0]['data']
+    if post and post.get('crosspost_parent_list'):
+        post = post['crosspost_parent_list'][0]
+    return post
+
+
 def rd_get_post(pid):
-    """Post data from Reddit's JSON views. Returns (post_dict or None, notes)."""
+    """Post data. Tries Reddit's own JSON addresses first, then a public Reddit archive (PullPush),
+    because Reddit blocks many server addresses. Returns (post_dict or None, notes)."""
     notes = []
-    for label, base in (('www', 'https://www.reddit.com'), ('old', 'https://old.reddit.com')):
-        status, final, text = fb_fetch(f'{base}/comments/{pid}/.json?raw_json=1&limit=1', UA)
+    sources = [
+        ('www', f'https://www.reddit.com/comments/{pid}/.json?raw_json=1&limit=1', UA),
+        ('old', f'https://old.reddit.com/comments/{pid}/.json?raw_json=1&limit=1', UA),
+        ('api', f'https://api.reddit.com/api/info/?id=t3_{pid}&raw_json=1', UA),
+        ('api-m', f'https://api.reddit.com/comments/{pid}?raw_json=1&limit=1', RD_UA_MOBILE),
+        ('archive', f'https://api.pullpush.io/reddit/search/submission/?ids={pid}', UA),
+    ]
+    for label, url, ua in sources:
+        status, final, text = fb_fetch(url, ua)
         if status == 200 and text.lstrip().startswith(('[', '{')):
             try:
-                data = json.loads(text)
-                post = data[0]['data']['children'][0]['data']
-                if post.get('crosspost_parent_list'):
-                    post = post['crosspost_parent_list'][0]
-                return post, notes
-            except Exception as e:
+                post = _rd_post_from_json(text)
+                if post:
+                    return post, notes
+                notes.append(f'{label}: empty')
+            except Exception:
                 notes.append(f'{label}: bad json')
-                continue
+            continue
         notes.append(f'{label}: http={status}')
     return None, notes
 
@@ -1890,7 +1915,7 @@ def extract_reddit(raw_url, mode='video'):
     post, notes = rd_get_post(pid)
     if not post:
         joined = ' | '.join(notes)
-        if re.search(r'http=40[13]|http=429', joined):
+        if re.search(r'http=40[13]|http=429', joined) and 'http=404' not in joined.split('archive')[0]:
             msg = 'Reddit is blocking the request from this server, or the post is private. Please try again later.'
         elif 'http=404' in joined:
             msg = 'This Reddit post was not found. It may have been deleted.'
