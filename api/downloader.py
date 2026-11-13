@@ -30,7 +30,8 @@ ALLOWED_PROXY_SUFFIXES = (
     'byteoversea.com',
     'ibyteimg.com',
     'ibytedtos.com',
-    'muscdn.com'
+    'muscdn.com',
+    'pinimg.com',
 )
 
 
@@ -915,6 +916,246 @@ def extract_facebook(raw_url):
     return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
 
 
+# ---------------------------------------------------------------------------
+# Pinterest
+# Order: Pinterest's own pin data (what the website itself loads) -> JSON inside the pin page ->
+# preview tags -> yt-dlp (videos only). Images are upgraded to the original size when it exists.
+# ---------------------------------------------------------------------------
+def is_pinterest_url(raw_url):
+    try:
+        p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+        host = (p.hostname or '').lower()
+    except Exception:
+        return False
+    return host == 'pin.it' or bool(re.search(r'(^|\.)pinterest\.[a-z.]+$', host))
+
+
+def resolve_pin_url(url):
+    p = urllib.parse.urlparse(url if '://' in url else 'https://' + url)
+    if (p.hostname or '').lower() == 'pin.it':
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9'})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.geturl()
+        except Exception:
+            return url
+    return url
+
+
+def pin_id_from_url(url):
+    m = re.search(r'/pin/(?:[^/?#]*?--)?(\d{6,})', url)
+    return m.group(1) if m else None
+
+
+def pin_http_json(url, extra_headers=None):
+    headers = {'User-Agent': UA, 'Accept': 'application/json, text/javascript, */*; q=0.01',
+               'Accept-Language': 'en-US,en;q=0.9', 'X-Requested-With': 'XMLHttpRequest',
+               'Referer': 'https://www.pinterest.com/'}
+    headers.update(extra_headers or {})
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode('utf-8', errors='ignore'))
+
+
+def pin_api_data(pid):
+    opts = json.dumps({'options': {'id': pid, 'field_set_key': 'detailed'}, 'context': {}}, separators=(',', ':'))
+    src = urllib.parse.quote(f'/pin/{pid}/', safe='')
+    url = ('https://www.pinterest.com/resource/PinResource/get/?source_url=' + src
+           + '&data=' + urllib.parse.quote(opts, safe=''))
+    body = pin_http_json(url, {'X-Pinterest-PWS-Handler': 'www/pin/[id].js'})
+    return ((body.get('resource_response') or {}).get('data')) or None
+
+
+def _pin_height(key, entry):
+    h = entry.get('height') if isinstance(entry, dict) else None
+    if h:
+        return int(h)
+    m = re.search(r'(\d{3,4})P', str(key).upper())
+    return int(m.group(1)) if m else 0
+
+
+def _pin_videos(video_list):
+    """[(height, url)] of plain MP4 files, tallest first (HLS playlists are skipped)."""
+    out = []
+    for key, entry in (video_list or {}).items():
+        url = entry.get('url') if isinstance(entry, dict) else None
+        if url and urllib.parse.urlparse(url).path.lower().endswith('.mp4'):
+            out.append((_pin_height(key, entry), url))
+    out.sort(reverse=True)
+    seen, res = set(), []
+    for h, u in out:
+        if u not in seen:
+            seen.add(u)
+            res.append((h, u))
+    return res
+
+
+def _pin_image(images):
+    """Best image URL from a Pinterest 'images' dict."""
+    if not isinstance(images, dict):
+        return None
+    for k in ('orig', 'originals'):
+        if isinstance(images.get(k), dict) and images[k].get('url'):
+            return images[k]['url']
+    best, best_w = None, -1
+    for v in images.values():
+        if isinstance(v, dict) and v.get('url') and (v.get('width') or 0) > best_w:
+            best, best_w = v['url'], v.get('width') or 0
+    return best
+
+
+def pin_upgrade_image(u):
+    """Pinterest keeps the original at /originals/ with the same file name as the resized copies."""
+    m = re.match(r'(https?://i\.pinimg\.com/)(\d+x(?:\d+)?|\d+x)/(.+)$', u)
+    if not m:
+        return u
+    cand = f'{m.group(1)}originals/{m.group(3)}'
+    try:
+        req = urllib.request.Request(cand, headers={'User-Agent': UA}, method='HEAD')
+        with urllib.request.urlopen(req, timeout=8) as r:
+            if r.status == 200:
+                return cand
+    except Exception:
+        pass
+    return u
+
+
+def pin_media_from_data(d):
+    """Pinterest pin data -> result dict, or None."""
+    title = (d.get('grid_title') or d.get('title') or d.get('seo_title') or d.get('description') or '').strip()
+    cover = _pin_image(d.get('images'))
+
+    # Story / idea pins: several pages of images and videos
+    items = []
+    pages = ((d.get('story_pin_data') or {}).get('pages')) or []
+    for page in pages:
+        for block in page.get('blocks') or []:
+            vid = block.get('video') or {}
+            vids = _pin_videos(vid.get('video_list'))
+            if vids:
+                items.append({'url': vids[0][1], 'type': 'video'})
+                continue
+            img = _pin_image((block.get('image') or {}).get('images'))
+            if img:
+                items.append({'url': img, 'type': 'image'})
+    if items:
+        return _fb_result(items, title[:150], cover or (items[0]['url'] if items[0]['type'] == 'image' else ''))
+
+    vids = _pin_videos((d.get('videos') or {}).get('video_list'))
+    if vids:
+        qualities = [{'label': (f'{h}p' if h else 'Video'), 'url': u} for h, u in vids]
+        return _fb_result([{'url': vids[0][1], 'type': 'video'}], title[:150], cover, qualities,
+                          None, (d.get('videos') or {}).get('duration') and (d['videos']['duration'] / 1000.0))
+
+    if cover:
+        return _fb_result([{'url': pin_upgrade_image(cover), 'type': 'image'}], title[:150], cover)
+    return None
+
+
+def _pin_walk_find(obj, pid, depth=0):
+    if depth > 12:
+        return None
+    if isinstance(obj, dict):
+        if str(obj.get('id')) == pid and any(k in obj for k in ('images', 'videos', 'story_pin_data')):
+            return obj
+        for v in obj.values():
+            r = _pin_walk_find(v, pid, depth + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _pin_walk_find(v, pid, depth + 1)
+            if r:
+                return r
+    return None
+
+
+def pin_from_page(url, pid):
+    """Pin page: JSON blocks first, then the preview tags. Returns (result_or_None, note)."""
+    status, final, page = fb_fetch(url, UA)
+    if status != 200 or not page:
+        return None, f'page: http={status}'
+    for m in re.finditer(r'<script[^>]*id="(__PWS_[A-Z_]*DATA__|__PWS_INITIAL_PROPS__)"[^>]*>(.*?)</script>', page, re.S):
+        try:
+            data = json.loads(m.group(2))
+        except Exception:
+            continue
+        node = _pin_walk_find(data, pid)
+        if node:
+            res = pin_media_from_data(node)
+            if res:
+                return res, 'page-json ok'
+
+    title = (_og_values(page, 'og:title') or [''])[0]
+    videos = [v for v in _og_values(page, 'og:video') + _og_values(page, 'og:video:url')
+              if urllib.parse.urlparse(v).path.lower().endswith('.mp4')]
+    thumb = next((v for v in _og_values(page, 'og:image') if 'pinimg.com' in v), '')
+    if videos:
+        return _fb_result([{'url': videos[0], 'type': 'video'}], title, thumb,
+                          [{'label': 'Video', 'url': videos[0]}]), 'og-video ok'
+    if thumb:
+        return _fb_result([{'url': pin_upgrade_image(thumb), 'type': 'image'}], title, thumb), 'og-image ok'
+    return None, f'page: http={status} bytes={len(page)} nothing found'
+
+
+def pin_via_ytdlp(url):
+    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        return None
+    prog = []
+    for f in info.get('formats') or []:
+        u = f.get('url')
+        if u and 'm3u8' not in str(f.get('protocol') or '') and urllib.parse.urlparse(u).path.lower().endswith('.mp4'):
+            prog.append((f.get('height') or 0, u))
+    prog.sort(reverse=True)
+    if prog:
+        q = [{'label': (f'{h}p' if h else 'Video'), 'url': u} for h, u in prog]
+        return _fb_result([{'url': prog[0][1], 'type': 'video'}], (info.get('title') or '')[:150],
+                          info.get('thumbnail'), q, None, info.get('duration'))
+    return None
+
+
+def extract_pinterest(raw_url, mode='image'):
+    url = resolve_pin_url(raw_url.strip())
+    pid = pin_id_from_url(url)
+    if not pid:
+        return {'error': 'Could not find a pin in this link. Please paste a full Pinterest pin link (pinterest.com/pin/...) or a pin.it link.'}
+    clean = f'https://www.pinterest.com/pin/{pid}/'
+
+    notes, result = [], None
+    try:
+        data = pin_api_data(pid)
+        if data:
+            result = pin_media_from_data(data)
+            notes.append('api ok' if result else 'api: no media in data')
+        else:
+            notes.append('api: empty')
+    except urllib.error.HTTPError as e:
+        notes.append(f'api: http {e.code}')
+    except Exception as e:
+        notes.append('api: ' + re.sub(r'\s+', ' ', str(e))[:80])
+
+    if not result:
+        result, note = pin_from_page(clean, pid)
+        notes.append(note)
+    if not result:
+        try:
+            result = pin_via_ytdlp(clean)
+            notes.append('yt-dlp ok' if result else 'yt-dlp: no video')
+        except Exception as e:
+            notes.append('yt-dlp: ' + re.sub(r'\s+', ' ', str(e))[:100])
+
+    if result:
+        return result
+    joined = ' | '.join(notes)
+    if re.search(r'http (?:401|403|404)|not found|private', joined, re.I):
+        msg = 'This pin could not be found or is private, so it cannot be downloaded.'
+    else:
+        msg = 'Could not get this Pinterest pin. It may be private or removed, or Pinterest may be blocking the request.'
+    return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
+
+
 def ffmpeg_path():
     try:
         import imageio_ffmpeg
@@ -1057,6 +1298,13 @@ class handler(BaseHTTPRequestHandler):
             # ---- Facebook Route ----
             if is_facebook_url(raw_url):
                 result = extract_facebook(raw_url)
+                if 'error' in result:
+                    return self._json(500, {'error': result['error']})
+                return self._json(200, result)
+
+            # ---- Pinterest Route ----
+            if is_pinterest_url(raw_url):
+                result = extract_pinterest(raw_url, str(data.get('mode') or 'image'))
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
