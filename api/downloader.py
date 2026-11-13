@@ -1253,25 +1253,29 @@ def vimeo_hls_from_cfg(cfg):
     The server later joins the pieces into one MP4 with ffmpeg."""
     hls = ((cfg.get('request') or {}).get('files') or {}).get('hls') or {}
     cdns = hls.get('cdns') or {}
-    master = None
-    default = hls.get('default_cdn')
-    if default in cdns and cdns[default].get('url'):
-        master = cdns[default]['url']
-    if not master:
-        for c in cdns.values():
-            if c.get('url'):
-                master = c['url']
-                break
-    if not master:
-        return [], None
+    masters = []
+    if hls.get('default_cdn') in cdns and cdns[hls['default_cdn']].get('url'):
+        masters.append(cdns[hls['default_cdn']]['url'])
+    masters += [c['url'] for c in cdns.values() if c.get('url') and c['url'] not in masters]
 
-    req = urllib.request.Request(master, headers={'User-Agent': UA, 'Referer': 'https://vimeo.com/'})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        text = r.read().decode('utf-8', errors='ignore')
+    for master in masters:
+        if '/drm/' in master:
+            continue
+        try:
+            req = urllib.request.Request(master, headers={'User-Agent': UA, 'Referer': 'https://vimeo.com/'})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                text = r.read().decode('utf-8', errors='ignore')
+        except Exception:
+            continue
+        if 'skd://' in text or 'URI="skd' in text:
+            continue        # Apple-only encrypted playlist: ffmpeg cannot open it
+        out, audio = _vimeo_parse_hls_master(master, text)
+        if out:
+            return out, audio
+    return [], None
 
-    if 'skd://' in text or '/drm/' in master:
-        return [], None        # Apple-only encrypted playlist: ffmpeg cannot open it
 
+def _vimeo_parse_hls_master(master, text):
     audio_groups = {}
     for line in text.splitlines():
         if line.startswith('#EXT-X-MEDIA') and 'TYPE=AUDIO' in line:
@@ -1358,10 +1362,10 @@ def vimeo_dash_playlist(cfg):
     why = ''
     for u in urls:
         try:
-            pl, why = vimeo_load_dash(u)
+            pl, why_now = vimeo_load_dash(u)
             if pl:
                 return u, pl, ''
-            return None, None, why
+            why = why_now
         except urllib.error.HTTPError as e:
             why = f'http {e.code} ' + (urllib.parse.urlparse(u).path.rsplit('/', 1)[-1])[:30]
         except Exception as e:
