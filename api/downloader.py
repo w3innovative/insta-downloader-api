@@ -1326,20 +1326,44 @@ def _vimeo_get(url, tries=3):
     raise last
 
 
+def vimeo_files_summary(cfg):
+    """Short description of what Vimeo's player data offers (for error messages only)."""
+    files = (cfg.get('request') or {}).get('files') or {}
+    parts = []
+    for kind, val in files.items():
+        if isinstance(val, dict):
+            cdns = val.get('cdns') or {}
+            sample = next((c.get('url', '') for c in cdns.values() if isinstance(c, dict)), '')
+            path = urllib.parse.urlparse(sample).path
+            m = re.search(r'/(v\d+/[a-z]+/[\w,]+|[^/]+)/[^/]*$', path)
+            parts.append(f"{kind}[{len(cdns)} cdn{'' if not m else ' ' + m.group(1)[:40]}]")
+        elif isinstance(val, list):
+            parts.append(f'{kind}[{len(val)}]')
+        else:
+            parts.append(kind)
+    return 'files=' + (','.join(parts) or 'none') + ' | keys=' + ','.join(sorted((cfg.get('request') or {}).keys()))[:80]
+
+
 def vimeo_dash_playlist(cfg):
-    """DASH manifest of the video (playlist.json): clear segments listed one by one. Returns (url, json) or (None, None)."""
+    """DASH manifest of the video (playlist.json): clear segments listed one by one.
+    Returns (url, json, reason) - url/json are None when it could not be loaded."""
     dash = ((cfg.get('request') or {}).get('files') or {}).get('dash') or {}
     cdns = dash.get('cdns') or {}
     urls = []
     if dash.get('default_cdn') in cdns and cdns[dash['default_cdn']].get('url'):
         urls.append(cdns[dash['default_cdn']]['url'])
     urls += [c['url'] for c in cdns.values() if c.get('url') and c['url'] not in urls]
+    if not urls:
+        return None, None, 'not in player data'
+    why = ''
     for u in urls:
         try:
-            return u, json.loads(_vimeo_get(u).decode('utf-8', errors='ignore'))
-        except Exception:
-            continue
-    return None, None
+            return u, json.loads(_vimeo_get(u).decode('utf-8', errors='ignore')), ''
+        except urllib.error.HTTPError as e:
+            why = f'http {e.code} ' + (urllib.parse.urlparse(u).path.rsplit('/', 1)[-1])[:30]
+        except Exception as e:
+            why = re.sub(r'\s+', ' ', f'{type(e).__name__}: {e}')[:80]
+    return None, None, why
 
 
 def vimeo_dash_heights(pl):
@@ -1400,13 +1424,13 @@ def extract_vimeo(raw_url, mode='video'):
         prog = vimeo_progressive_from_cfg(cfg)
         if not prog:
             try:
-                dash_url, pl = vimeo_dash_playlist(cfg)
+                dash_url, pl, why = vimeo_dash_playlist(cfg)
                 if pl:
                     dash_streams = vimeo_dash_heights(pl)
                     if not dash_streams:
-                        notes.append('dash: no h264 streams')
+                        notes.append('dash: no h264 streams (' + ','.join(sorted({str(x.get('codecs'))[:8] for x in pl.get('video') or []}))[:60] + ')')
                 else:
-                    notes.append('dash: not available')
+                    notes.append('dash: ' + why)
             except Exception as e:
                 notes.append('dash: ' + re.sub(r'\s+', ' ', str(e))[:100])
             if not dash_streams:
@@ -1417,7 +1441,7 @@ def extract_vimeo(raw_url, mode='video'):
                 except Exception as e:
                     notes.append('hls: ' + re.sub(r'\s+', ' ', str(e))[:100])
             if not dash_streams and not hls_v:
-                notes.append('player: no downloadable streams')
+                notes.append('player: no downloadable streams; ' + vimeo_files_summary(cfg))
     except urllib.error.HTTPError as e:
         notes.append(f'player: http {e.code}')
     except Exception as e:
