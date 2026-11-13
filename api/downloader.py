@@ -38,8 +38,8 @@ ALLOWED_PROXY_SUFFIXES = (
     'vod-adaptive.akamaized.net',
     'sndcdn.com',
     'soundcloud.cloud',
-    'redd.it',
-    'redditmedia.com',
+    'dailymotion.com',
+    'dmcdn.net',
 )
 
 
@@ -1677,26 +1677,37 @@ def extract_soundcloud(raw_url, mode='mp3'):
 
 
 # ---------------------------------------------------------------------------
-# Reddit
-# Post data comes from Reddit's public .json view of the post. Videos are stored as separate picture and
-# sound files on v.redd.it; the server joins them into one MP4 with ffmpeg when a button is clicked.
-# Direct v.redd.it / i.redd.it links need no Reddit page at all.
+# Dailymotion
+# Stream list comes from Dailymotion's public player data. Qualities are streaming playlists; the server
+# joins them into one MP4 with ffmpeg when a button is clicked (ready-made MP4 files are used when offered).
 # ---------------------------------------------------------------------------
-def is_reddit_url(raw_url):
+def is_dailymotion_url(raw_url):
     try:
         p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
         host = (p.hostname or '').lower()
     except Exception:
         return False
-    return (host in ('redd.it', 'reddit.com') or host.endswith('.redd.it') or host.endswith('.reddit.com'))
+    return host in ('dai.ly', 'dailymotion.com') or host.endswith('.dailymotion.com')
 
 
-def rd_token(video_url, audio_url):
+def dm_video_id(raw_url):
+    p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+    q = urllib.parse.parse_qs(p.query)
+    if (q.get('video') or [''])[0]:
+        return q['video'][0]
+    if (p.hostname or '').lower() == 'dai.ly':
+        m = re.match(r'/([A-Za-z0-9]+)', p.path)
+        return m.group(1) if m else None
+    m = re.search(r'/(?:video|embed/video|player/metadata/video)/([A-Za-z0-9]+)', p.path)
+    return m.group(1) if m else None
+
+
+def hls_token(video_url=None, audio_url=None):
     raw = json.dumps({'v': video_url, 'a': audio_url}, separators=(',', ':')).encode('utf-8')
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
-def rd_untoken(tok):
+def hls_untoken(tok):
     d = json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4)))
     for key in ('v', 'a'):
         if d.get(key) and not host_allowed(d[key]):
@@ -1706,229 +1717,92 @@ def rd_untoken(tok):
     return d.get('v'), d.get('a')
 
 
-def rd_clean(u):
-    return htmllib.unescape(u or '')
-
-
-def rd_post_id(url):
-    m = re.search(r'/comments/([a-z0-9]{5,10})', url)
-    if m:
-        return m.group(1)
-    p = urllib.parse.urlparse(url)
-    if (p.hostname or '').lower() == 'redd.it':
-        m = re.fullmatch(r'/([a-z0-9]{5,10})', p.path)
-        return m.group(1) if m else None
-    return None
-
-
-def rd_resolve(url):
-    """Share links (/s/xxxx) and redd.it/<id> redirect to the real post."""
-    p = urllib.parse.urlparse(url if '://' in url else 'https://' + url)
-    host = (p.hostname or '').lower()
-    if host == 'redd.it' or re.search(r'/s/[A-Za-z0-9]+/?$', p.path):
-        status, final, _ = fb_fetch(url, UA)
-        if status == 200 and final != url:
-            return final
-        if host == 'redd.it':
-            return url
-    return url
-
-
-RD_UA_MOBILE = ('Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 '
-                '(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1')
-
-
-def _rd_post_from_json(text):
-    """Reddit JSON (listing of comments, or an info listing) / PullPush JSON -> post dict, or None."""
-    data = json.loads(text)
-    if isinstance(data, dict) and isinstance(data.get('data'), list):          # PullPush
-        post = data['data'][0] if data['data'] else None
-    elif isinstance(data, list):                                                # /comments/ID.json
-        post = data[0]['data']['children'][0]['data']
-    else:                                                                       # /api/info
-        post = data['data']['children'][0]['data']
-    if post and post.get('crosspost_parent_list'):
-        post = post['crosspost_parent_list'][0]
-    return post
-
-
-def rd_get_post(pid):
-    """Post data. Tries Reddit's own JSON addresses first, then a public Reddit archive (PullPush),
-    because Reddit blocks many server addresses. Returns (post_dict or None, notes)."""
-    notes = []
-    sources = [
-        ('www', f'https://www.reddit.com/comments/{pid}/.json?raw_json=1&limit=1', UA),
-        ('old', f'https://old.reddit.com/comments/{pid}/.json?raw_json=1&limit=1', UA),
-        ('api', f'https://api.reddit.com/api/info/?id=t3_{pid}&raw_json=1', UA),
-        ('api-m', f'https://api.reddit.com/comments/{pid}?raw_json=1&limit=1', RD_UA_MOBILE),
-        ('archive', f'https://api.pullpush.io/reddit/search/submission/?ids={pid}', UA),
-    ]
-    for label, url, ua in sources:
-        status, final, text = fb_fetch(url, ua)
-        if status == 200 and text.lstrip().startswith(('[', '{')):
-            try:
-                post = _rd_post_from_json(text)
-                if post:
-                    return post, notes
-                notes.append(f'{label}: empty')
-            except Exception:
-                notes.append(f'{label}: bad json')
-            continue
-        notes.append(f'{label}: http={status}')
-    return None, notes
-
-
-def rd_mpd(vid):
-    """DASHPlaylist.mpd of a v.redd.it video -> ([(height, url)], audio_url)."""
-    import xml.etree.ElementTree as ET
-    mpd_url = f'https://v.redd.it/{vid}/DASHPlaylist.mpd'
-    status, final, text = fb_fetch(mpd_url, UA)
-    if status != 200 or not text.lstrip().startswith('<'):
-        return [], None
-    root = ET.fromstring(text)
-    def local(t):
-        return t.rsplit('}', 1)[-1]
-    videos, audio = [], None
-    for aset in root.iter():
-        if local(aset.tag) != 'AdaptationSet':
-            continue
-        kind = (aset.get('contentType') or aset.get('mimeType') or '').lower()
-        for rep in aset:
-            if local(rep.tag) != 'Representation':
-                continue
-            rkind = (rep.get('mimeType') or kind).lower()
-            base = next((c.text.strip() for c in rep if local(c.tag) == 'BaseURL' and c.text), None)
-            if not base:
-                continue
-            absu = urllib.parse.urljoin(mpd_url, base)
-            if rkind.startswith('audio') or kind.startswith('audio'):
-                audio = audio or absu
-            else:
-                videos.append((int(rep.get('height') or 0), absu))
-    videos.sort(reverse=True)
-    return videos, audio
-
-
-def rd_head_ok(url):
+def dm_metadata(vid):
+    """(metadata_dict or None, note)."""
+    status, final, text = fb_fetch(f'https://www.dailymotion.com/player/metadata/video/{vid}', UA)
+    if status != 200 or not text.lstrip().startswith('{'):
+        return None, f'metadata: http={status}'
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': UA}, method='HEAD')
-        with urllib.request.urlopen(req, timeout=8) as r:
-            return r.status == 200
+        return json.loads(text), ''
     except Exception:
-        return False
+        return None, 'metadata: bad json'
 
 
-def rd_video_result(vid, title, thumb, duration, fallback_url=None):
-    videos, audio = rd_mpd(vid)
-    if not videos and fallback_url:
-        m = re.search(r'DASH_(\d+)', fallback_url)
-        videos = [(int(m.group(1)) if m else 0, rd_clean(fallback_url))]
-    if not videos:
-        return None
-    if not audio:
-        for name in ('DASH_AUDIO_128.mp4', 'DASH_audio.mp4', 'DASH_AUDIO_64.mp4', 'DASH_AUDIO_192.mp4'):
-            cand = f'https://v.redd.it/{vid}/{name}'
-            if rd_head_ok(cand):
-                audio = cand
-                break
-    qualities = []
-    for h, u in videos:
-        label = f'{h}p' if h else 'Video'
-        if audio:
-            qualities.append({'label': label, 'rv': rd_token(u, audio)})
+def extract_dailymotion(raw_url, mode='video'):
+    url = raw_url.strip()
+    vid = dm_video_id(url)
+    if not vid:
+        return {'error': 'Could not find a video in this link. Please paste a full Dailymotion video link '
+                         '(dailymotion.com/video/...).'}
+    meta, note = dm_metadata(vid)
+    if not meta:
+        return {'error': 'Could not read this Dailymotion video. It may be private, or Dailymotion may be blocking the '
+                         'request. [DEBUG: ' + note + ']'}
+    err = meta.get('error')
+    if err:
+        text = ((err.get('title') or '') + ' ' + (err.get('message') or '')).strip()
+        kind = str(err.get('type') or '')
+        if 'geo' in kind or 'country' in text.lower():
+            human = 'This Dailymotion video is not available in the country where the server runs.'
+        elif re.search(r'private|password|access|age|explicit|login|sign', kind + ' ' + text, re.I):
+            human = 'This Dailymotion video is private, age-restricted or protected, so it cannot be downloaded.'
         else:
-            qualities.append({'label': label, 'url': u})
-    res = _fb_result([], title[:150], thumb, qualities, None, duration)
-    res['is_image'] = False
-    res['preview_url'] = videos[-1][1]
-    res['has_audio'] = bool(audio)
-    if audio:
-        res['audio_rv'] = rd_token(None, audio)
-    return res
+            human = 'This Dailymotion video is not available.'
+        return {'error': human + ' [DEBUG: ' + re.sub(r'\s+', ' ', kind + ': ' + text)[:200] + ']'}
 
+    title = (meta.get('title') or '').strip()
+    owner = ((meta.get('owner') or {}).get('screenname') or '').strip()
+    thumb = meta.get('poster_url') or ''
+    if not thumb:
+        posters = meta.get('posters') or {}
+        thumb = posters.get(max(posters, key=lambda k: int(k) if str(k).isdigit() else 0)) if posters else ''
+    duration = meta.get('duration')
 
-def rd_result_from_post(post):
-    title = (post.get('title') or '').strip()
-    prev = ((post.get('preview') or {}).get('images') or [{}])[0].get('source', {}).get('url') or ''
-    thumb = rd_clean(prev) or (post.get('thumbnail') if str(post.get('thumbnail', '')).startswith('http') else '')
-
-    media = (post.get('secure_media') or post.get('media') or {}).get('reddit_video')
-    if media or post.get('is_video'):
-        media = media or {}
-        fb = media.get('fallback_url') or ''
-        m = re.search(r'v\.redd\.it/([A-Za-z0-9]+)', fb or post.get('url') or '')
-        if m:
-            res = rd_video_result(m.group(1), title, thumb, media.get('duration'), fb)
-            if res:
-                return res
-
-    # GIFs: reddit-hosted looping video or a real .gif
-    prev_video = ((post.get('preview') or {}).get('reddit_video_preview')) or {}
-    url = rd_clean(post.get('url_overridden_by_dest') or post.get('url') or '')
-    if re.search(r'\.gif(?:\?|$)', url, re.I):
-        return _fb_result([{'url': url, 'type': 'image'}], title[:150], thumb)
-    if prev_video.get('fallback_url'):
-        v = rd_clean(prev_video['fallback_url'])
-        res = _fb_result([], title[:150], thumb, [{'label': 'GIF video', 'url': v}], None, prev_video.get('duration'))
-        res['is_image'] = False
-        res['preview_url'] = v
-        return res
-
-    # Gallery
-    if post.get('is_gallery') and post.get('gallery_data') and post.get('media_metadata'):
-        items = []
-        for it in post['gallery_data'].get('items') or []:
-            meta = post['media_metadata'].get(it.get('media_id')) or {}
-            if meta.get('status') != 'valid':
+    quals = meta.get('qualities') or {}
+    progressive, master = [], None
+    for key, entries in quals.items():
+        for e in entries or []:
+            t, u = str(e.get('type') or ''), e.get('url')
+            if not u:
                 continue
-            ext = {'image/jpg': 'jpg', 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp'}.get(meta.get('m'), 'jpg')
-            items.append({'url': f"https://i.redd.it/{it['media_id']}.{ext}", 'type': 'image'})
-        if items:
-            return _fb_result(items, title[:150], thumb or items[0]['url'])
+            if t == 'video/mp4' and str(key).isdigit():
+                progressive.append((int(key), u))
+            elif 'mpegurl' in t.lower() and (key == 'auto' or master is None):
+                master = u
+    progressive.sort(reverse=True)
 
-    # Single image
-    if post.get('post_hint') == 'image' or re.search(r'\.(?:jpe?g|png|webp)(?:\?|$)', url, re.I):
-        if 'redd.it' in url or 'redditmedia.com' in url:
-            return _fb_result([{'url': url, 'type': 'image'}], title[:150], thumb or url)
-    return None
+    qualities, audio_token = [], None
+    notes = []
+    if progressive:
+        qualities = [{'label': f'{h}p', 'url': u} for h, u in progressive]
+    elif master:
+        try:
+            status, final, text = fb_fetch(master, UA)
+            if status != 200 or '#EXTM3U' not in text:
+                notes.append(f'playlist: http={status}')
+            else:
+                variants, audio = _vimeo_parse_hls_master(final or master, text)
+                if not variants:
+                    notes.append('playlist: no h264 variants')
+                qualities = [{'label': f'{h}p', 'dm': hls_token(u, audio)} for h, u in variants]
+                if variants:
+                    audio_token = hls_token(audio, None) if audio else hls_token(variants[-1][1], None)
+        except Exception as e:
+            notes.append('playlist: ' + re.sub(r'\s+', ' ', str(e))[:100])
+    else:
+        notes.append('no streams in player data')
 
+    if not qualities:
+        return {'error': 'No downloadable video file was found for this Dailymotion video. [DEBUG: '
+                         + ' | '.join(notes)[:300] + ']'}
 
-def extract_reddit(raw_url, mode='video'):
-    url = rd_resolve(raw_url.strip())
-    p = urllib.parse.urlparse(url if '://' in url else 'https://' + url)
-    host = (p.hostname or '').lower()
-    path = p.path
-
-    # Direct media links
-    m = re.match(r'/([A-Za-z0-9]+)/?', path)
-    if host == 'v.redd.it' and m:
-        res = rd_video_result(m.group(1), '', '', None)
-        return res or {'error': 'Could not read this Reddit video. [DEBUG: v.redd.it: no playlist]'}
-    if host in ('i.redd.it', 'preview.redd.it') and re.search(r'\.(?:jpe?g|png|gif|webp)$', path, re.I):
-        clean = f'https://i.redd.it{path}' if host == 'preview.redd.it' else f'https://{host}{path}'
-        return _fb_result([{'url': clean, 'type': 'image'}], '', clean)
-
-    pid = rd_post_id(url)
-    if not pid:
-        return {'error': 'Could not find a post in this link. Please paste a full Reddit post link '
-                         '(reddit.com/r/.../comments/...).'}
-    post, notes = rd_get_post(pid)
-    if not post:
-        joined = ' | '.join(notes)
-        if re.search(r'http=40[13]|http=429', joined) and 'http=404' not in joined.split('archive')[0]:
-            msg = 'Reddit is blocking the request from this server, or the post is private. Please try again later.'
-        elif 'http=404' in joined:
-            msg = 'This Reddit post was not found. It may have been deleted.'
-        else:
-            msg = 'Could not read this Reddit post.'
-        return {'error': msg + ' [DEBUG: ' + joined[:300] + ']'}
-
-    res = rd_result_from_post(post)
-    if res:
-        return res
-    kind = post.get('post_hint') or ('text' if post.get('is_self') else 'link')
-    return {'error': 'This Reddit post has no video, image or GIF that can be downloaded '
-                     f'(post type: {kind}). Posts that link to other sites are not supported.'}
+    res = _fb_result([], (title + (f' — {owner}' if owner else ''))[:150], thumb, qualities, None, duration)
+    res['is_image'] = False
+    res['video_id'] = vid
+    res['embed_url'] = f'https://www.dailymotion.com/embed/video/{vid}'
+    if audio_token:
+        res['audio_dm'] = audio_token
+    return res
 
 
 FFMPEG_NOTE = ''
@@ -2152,31 +2026,29 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {'error': str(e)})
 
-    def _reddit_merge_download(self, query_params):
-        """Reddit video: joins the separate picture and sound files into one MP4 (or an MP3 of the sound)."""
+    def _hls_merge_download(self, query_params, key, referer):
+        """Streaming playlists -> one MP4 (or an MP3 of the sound) with ffmpeg. Used by Dailymotion."""
         try:
-            v, a = rd_untoken(query_params.get('rv', [''])[0])
+            v, a = hls_untoken(query_params.get(key, [''])[0])
         except Exception:
             return self._json(400, {'error': 'Invalid download link'})
         exe = ffmpeg_path()
         if not exe:
             return self._json(500, {'error': 'Video tools are not available on the server. '
                                              'Check that imageio-ffmpeg is listed in requirements.txt. [DEBUG: ' + FFMPEG_NOTE + ']'})
-        filename = query_params.get('filename', ['reddit-video'])[0].replace('"', '')
+        filename = query_params.get('filename', ['video'])[0].replace('"', '')
         want_mp3 = query_params.get('mp3', ['0'])[0] == '1'
         try:
             br = int(query_params.get('br', ['128'])[0])
         except ValueError:
             br = 128
         br = br if 32 <= br <= 128 else 128
-        hdr = 'User-Agent: ' + UA + '\r\nReferer: https://www.reddit.com/\r\n'
+        hdr = 'User-Agent: ' + UA + '\r\nReferer: ' + referer + '\r\n'
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 if want_mp3:
-                    if not a:
-                        return self._json(400, {'error': 'This video has no sound.'})
                     out = os.path.join(tmp, 'out.mp3')
-                    cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', a, '-vn', '-codec:a', 'libmp3lame', '-b:a', f'{br}k', out]
+                    cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', a or v, '-vn', '-codec:a', 'libmp3lame', '-b:a', f'{br}k', out]
                     ctype = 'audio/mpeg'
                     filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp3'
                 else:
@@ -2184,7 +2056,7 @@ class handler(BaseHTTPRequestHandler):
                     cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', v]
                     if a:
                         cmd += ['-headers', hdr, '-i', a]
-                    cmd += ['-map', '0:v:0'] + (['-map', '1:a:0'] if a else []) + ['-c', 'copy', '-movflags', '+faststart', out]
+                    cmd += ['-map', '0:v:0'] + (['-map', '1:a:0'] if a else ['-map', '0:a:0?']) + ['-c', 'copy', '-movflags', '+faststart', out]
                     ctype = 'video/mp4'
                     filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp4'
                 proc = subprocess.run(cmd, capture_output=True, timeout=55)
@@ -2206,13 +2078,13 @@ class handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
         except subprocess.TimeoutExpired:
-            return self._json(504, {'error': 'The video took too long to prepare. Please try again.'})
+            return self._json(504, {'error': 'The video took too long to prepare. Please try again or pick a lower quality.'})
         except Exception as e:
             return self._json(500, {'error': str(e)})
 
     def do_GET(self):
-        if 'rv' in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query):
-            return self._reddit_merge_download(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
+        if 'dm' in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query):
+            return self._hls_merge_download(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query), 'dm', 'https://www.dailymotion.com/')
         if 'sc=' in self.path and '?url=' not in self.path and 'vm=' not in self.path:
             return self._soundcloud_stream_download(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
         if 'vm=' in self.path and '?url=' not in self.path:
@@ -2341,9 +2213,9 @@ class handler(BaseHTTPRequestHandler):
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
 
-            # ---- Reddit Route ----
-            if is_reddit_url(raw_url):
-                result = extract_reddit(raw_url, str(data.get('mode') or 'video'))
+            # ---- Dailymotion Route ----
+            if is_dailymotion_url(raw_url):
+                result = extract_dailymotion(raw_url, str(data.get('mode') or 'video'))
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
