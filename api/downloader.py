@@ -32,6 +32,9 @@ ALLOWED_PROXY_SUFFIXES = (
     'ibytedtos.com',
     'muscdn.com',
     'pinimg.com',
+    'vimeocdn.com',
+    'vod-progressive.akamaized.net',
+    'gcs-vimeo.akamaized.net',
 )
 
 
@@ -394,6 +397,8 @@ def proxy_request_headers(target_url, h_param, client_range):
     headers = {'User-Agent': UA, 'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9'}
     if 'tiktok' in host or host.endswith('byteoversea.com'):
         headers['Referer'] = 'https://www.tiktok.com/'
+    if 'vimeo' in host or host.endswith('akamaized.net'):
+        headers['Referer'] = 'https://vimeo.com/'
     if h_param:
         try:
             extra = json.loads(base64.urlsafe_b64decode(h_param + '=' * (-len(h_param) % 4)))
@@ -1156,6 +1161,145 @@ def extract_pinterest(raw_url, mode='image'):
     return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
 
 
+# ---------------------------------------------------------------------------
+# Vimeo
+# Public videos come from yt-dlp (ready-made MP4 files with picture + sound). If yt-dlp cannot read the
+# video, the same player data the Vimeo website uses is tried. Private / embed-only videos are refused.
+# ---------------------------------------------------------------------------
+def is_vimeo_url(raw_url):
+    try:
+        p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+        host = (p.hostname or '').lower()
+    except Exception:
+        return False
+    return host == 'vimeo.com' or host.endswith('.vimeo.com')
+
+
+def vimeo_ids(raw_url):
+    """(video_id, unlisted_hash). Handles vimeo.com/ID, vimeo.com/ID/HASH, channels/groups links and player.vimeo.com/video/ID?h=HASH."""
+    p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+    q = urllib.parse.parse_qs(p.query)
+    parts = [x for x in p.path.split('/') if x]
+    vid, h = None, (q.get('h') or [None])[0]
+    for i, part in enumerate(parts):
+        if part.isdigit() and len(part) >= 5:
+            vid = part
+            nxt = parts[i + 1] if i + 1 < len(parts) else ''
+            if not h and re.fullmatch(r'[0-9a-f]{8,12}', nxt):
+                h = nxt
+            break
+    return vid, h
+
+
+def vimeo_watch_url(vid, h):
+    return f'https://vimeo.com/{vid}' + (f'/{h}' if h else '')
+
+
+def vimeo_embed_url(vid, h):
+    return f'https://player.vimeo.com/video/{vid}' + (f'?h={h}' if h else '')
+
+
+def vimeo_pick_progressive(formats):
+    """[(height, url)] of plain MP4 files with picture and sound, tallest first."""
+    out, seen = [], set()
+    for f in formats or []:
+        url = f.get('url')
+        proto = str(f.get('protocol') or '')
+        if not url or proto not in ('https', 'http') or f.get('vcodec') == 'none' or f.get('acodec') == 'none':
+            continue
+        if f.get('ext') not in (None, 'mp4') or url in seen:
+            continue
+        seen.add(url)
+        out.append((f.get('height') or 0, url))
+    out.sort(reverse=True)
+    return out
+
+
+def vimeo_via_ytdlp(watch_url):
+    opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'noplaylist': True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(watch_url, download=False)
+    if not info:
+        return None, None
+    return vimeo_pick_progressive(info.get('formats')), info
+
+
+def vimeo_via_player_config(vid, h):
+    """Vimeo's own player data: files.progressive = ready-made MP4 files."""
+    url = f'https://player.vimeo.com/video/{vid}/config' + (f'?h={h}' if h else '')
+    req = urllib.request.Request(url, headers={'User-Agent': UA, 'Referer': 'https://vimeo.com/',
+                                               'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        cfg = json.loads(r.read().decode('utf-8', errors='ignore'))
+    prog = ((cfg.get('request') or {}).get('files') or {}).get('progressive') or []
+    out = sorted(((int(x.get('height') or 0), x['url']) for x in prog if x.get('url')), reverse=True)
+    video = cfg.get('video') or {}
+    thumbs = video.get('thumbs') or {}
+    thumb = thumbs.get('1280') or thumbs.get('960') or thumbs.get('640') or ''
+    if not thumb and thumbs.get('base'):
+        thumb = thumbs['base'] + '_640'
+    info = {'title': video.get('title') or '', 'duration': video.get('duration'), 'thumbnail': thumb}
+    return out, info
+
+
+def vimeo_oembed(watch_url):
+    try:
+        u = 'https://vimeo.com/api/oembed.json?url=' + urllib.parse.quote(watch_url, safe='')
+        req = urllib.request.Request(u, headers={'User-Agent': UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode('utf-8', errors='ignore'))
+    except Exception:
+        return {}
+
+
+def extract_vimeo(raw_url, mode='video'):
+    vid, h = vimeo_ids(raw_url)
+    if not vid:
+        return {'error': 'Could not find a video in this link. Please paste a full Vimeo link (vimeo.com/123456789).'}
+    watch = vimeo_watch_url(vid, h)
+
+    notes, files, info = [], [], {}
+    try:
+        files, yi = vimeo_via_ytdlp(watch)
+        info = yi or {}
+        if not files:
+            notes.append('yt-dlp: no ready-made mp4')
+    except Exception as e:
+        notes.append('yt-dlp: ' + re.sub(r'\s+', ' ', str(e))[:150])
+    if not files:
+        try:
+            files, ci = vimeo_via_player_config(vid, h)
+            info = info or ci
+            if not files:
+                notes.append('player: no progressive files')
+        except urllib.error.HTTPError as e:
+            notes.append(f'player: http {e.code}')
+        except Exception as e:
+            notes.append('player: ' + re.sub(r'\s+', ' ', str(e))[:100])
+
+    if not files:
+        joined = ' | '.join(notes)
+        if re.search(r'private|password|log ?in|http (?:401|403)|embed|privacy|domain', joined, re.I):
+            msg = 'This Vimeo video is private, password-protected or limited to certain websites, so it cannot be downloaded.'
+        elif re.search(r'http 404|not found|does not exist|removed', joined, re.I):
+            msg = 'This Vimeo video was not found. It may have been deleted.'
+        else:
+            msg = 'Could not get this Vimeo video. It may be private, or Vimeo may be blocking the request.'
+        return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
+
+    oe = vimeo_oembed(watch) if not info.get('title') or not info.get('thumbnail') else {}
+    title = (info.get('title') or oe.get('title') or '').strip()
+    thumb = info.get('thumbnail') or oe.get('thumbnail_url') or ''
+    duration = info.get('duration') or oe.get('duration')
+
+    qualities = [{'label': (f'{hh}p' if hh else 'Video'), 'url': u} for hh, u in files]
+    smallest = files[-1][1]          # smallest file = fastest source for the MP3
+    res = _fb_result([{'url': files[0][1], 'type': 'video'}], title[:150], thumb, qualities, smallest, duration)
+    res['video_id'] = vid
+    res['embed_url'] = vimeo_embed_url(vid, h)
+    return res
+
+
 def ffmpeg_path():
     try:
         import imageio_ffmpeg
@@ -1305,6 +1449,13 @@ class handler(BaseHTTPRequestHandler):
             # ---- Pinterest Route ----
             if is_pinterest_url(raw_url):
                 result = extract_pinterest(raw_url, str(data.get('mode') or 'image'))
+                if 'error' in result:
+                    return self._json(500, {'error': result['error']})
+                return self._json(200, result)
+
+            # ---- Vimeo Route ----
+            if is_vimeo_url(raw_url):
+                result = extract_vimeo(raw_url, str(data.get('mode') or 'video'))
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
