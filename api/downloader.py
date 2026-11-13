@@ -35,6 +35,7 @@ ALLOWED_PROXY_SUFFIXES = (
     'vimeocdn.com',
     'vod-progressive.akamaized.net',
     'gcs-vimeo.akamaized.net',
+    'vod-adaptive.akamaized.net',
 )
 
 
@@ -1224,22 +1225,91 @@ def vimeo_via_ytdlp(watch_url):
     return vimeo_pick_progressive(info.get('formats')), info
 
 
-def vimeo_via_player_config(vid, h):
-    """Vimeo's own player data: files.progressive = ready-made MP4 files."""
+def vimeo_player_config(vid, h):
+    """Vimeo's own player data (what the website loads). Raises on HTTP errors."""
     url = f'https://player.vimeo.com/video/{vid}/config' + (f'?h={h}' if h else '')
     req = urllib.request.Request(url, headers={'User-Agent': UA, 'Referer': 'https://vimeo.com/',
                                                'Accept': 'application/json'})
     with urllib.request.urlopen(req, timeout=20) as r:
-        cfg = json.loads(r.read().decode('utf-8', errors='ignore'))
-    prog = ((cfg.get('request') or {}).get('files') or {}).get('progressive') or []
-    out = sorted(((int(x.get('height') or 0), x['url']) for x in prog if x.get('url')), reverse=True)
+        return json.loads(r.read().decode('utf-8', errors='ignore'))
+
+
+def vimeo_info_from_cfg(cfg):
     video = cfg.get('video') or {}
     thumbs = video.get('thumbs') or {}
     thumb = thumbs.get('1280') or thumbs.get('960') or thumbs.get('640') or ''
     if not thumb and thumbs.get('base'):
         thumb = thumbs['base'] + '_640'
-    info = {'title': video.get('title') or '', 'duration': video.get('duration'), 'thumbnail': thumb}
-    return out, info
+    return {'title': video.get('title') or '', 'duration': video.get('duration'), 'thumbnail': thumb}
+
+
+def vimeo_progressive_from_cfg(cfg):
+    prog = ((cfg.get('request') or {}).get('files') or {}).get('progressive') or []
+    return sorted(((int(x.get('height') or 0), x['url']) for x in prog if x.get('url')), reverse=True)
+
+
+def vimeo_hls_from_cfg(cfg):
+    """Streaming playlists -> ([(height, video_playlist_url)], audio_playlist_url or None).
+    The server later joins the pieces into one MP4 with ffmpeg."""
+    hls = ((cfg.get('request') or {}).get('files') or {}).get('hls') or {}
+    cdns = hls.get('cdns') or {}
+    master = None
+    default = hls.get('default_cdn')
+    if default in cdns and cdns[default].get('url'):
+        master = cdns[default]['url']
+    if not master:
+        for c in cdns.values():
+            if c.get('url'):
+                master = c['url']
+                break
+    if not master:
+        return [], None
+
+    req = urllib.request.Request(master, headers={'User-Agent': UA, 'Referer': 'https://vimeo.com/'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        text = r.read().decode('utf-8', errors='ignore')
+
+    audio_groups = {}
+    for line in text.splitlines():
+        if line.startswith('#EXT-X-MEDIA') and 'TYPE=AUDIO' in line:
+            gid = re.search(r'GROUP-ID="([^"]+)"', line)
+            uri = re.search(r'URI="([^"]+)"', line)
+            if uri:
+                audio_groups.setdefault(gid.group(1) if gid else '', urllib.parse.urljoin(master, uri.group(1)))
+
+    variants = {}
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith('#EXT-X-STREAM-INF') or i + 1 >= len(lines):
+            continue
+        res = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+        bw = re.search(r'BANDWIDTH=(\d+)', line)
+        codecs = (re.search(r'CODECS="([^"]+)"', line) or [None, ''])[1]
+        if not res or re.search(r'hvc1|hev1|av01|vp09', codecs):
+            continue        # h264 only: plays everywhere
+        height = min(int(res.group(1)), int(res.group(2)))
+        uri = urllib.parse.urljoin(master, lines[i + 1].strip())
+        score = int(bw.group(1)) if bw else 0
+        if height not in variants or score > variants[height][0]:
+            variants[height] = (score, uri)
+    out = sorted(((h, v[1]) for h, v in variants.items()), reverse=True)
+    audio = next(iter(audio_groups.values()), None)
+    return out, audio
+
+
+def vimeo_token(video_url, audio_url):
+    raw = json.dumps({'v': video_url, 'a': audio_url}, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def vimeo_untoken(tok):
+    d = json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4)))
+    v, a = d.get('v'), d.get('a')
+    if v and not host_allowed(v):
+        raise ValueError('disallowed host')
+    if a and not host_allowed(a):
+        raise ValueError('disallowed host')
+    return v, a
 
 
 def vimeo_oembed(watch_url):
@@ -1258,33 +1328,44 @@ def extract_vimeo(raw_url, mode='video'):
         return {'error': 'Could not find a video in this link. Please paste a full Vimeo link (vimeo.com/123456789).'}
     watch = vimeo_watch_url(vid, h)
 
-    notes, files, info = [], [], {}
-    try:
-        files, yi = vimeo_via_ytdlp(watch)
-        info = yi or {}
-        if not files:
-            notes.append('yt-dlp: no ready-made mp4')
-    except Exception as e:
-        notes.append('yt-dlp: ' + re.sub(r'\s+', ' ', str(e))[:150])
-    if not files:
-        try:
-            files, ci = vimeo_via_player_config(vid, h)
-            info = info or ci
-            if not files:
-                notes.append('player: no progressive files')
-        except urllib.error.HTTPError as e:
-            notes.append(f'player: http {e.code}')
-        except Exception as e:
-            notes.append('player: ' + re.sub(r'\s+', ' ', str(e))[:100])
+    notes, info, cfg_ok = [], {}, False
+    prog, hls_v, hls_a = [], [], None
 
-    if not files:
+    # 1) Vimeo's player data: ready-made MP4 files, or streaming playlists
+    try:
+        cfg = vimeo_player_config(vid, h)
+        cfg_ok = True
+        info = vimeo_info_from_cfg(cfg)
+        prog = vimeo_progressive_from_cfg(cfg)
+        if not prog:
+            try:
+                hls_v, hls_a = vimeo_hls_from_cfg(cfg)
+            except Exception as e:
+                notes.append('hls: ' + re.sub(r'\s+', ' ', str(e))[:100])
+            if not hls_v:
+                notes.append('player: no downloadable streams')
+    except urllib.error.HTTPError as e:
+        notes.append(f'player: http {e.code}')
+    except Exception as e:
+        notes.append('player: ' + re.sub(r'\s+', ' ', str(e))[:100])
+
+    # 2) yt-dlp as a backup
+    if not prog and not hls_v:
+        try:
+            files, yi = vimeo_via_ytdlp(watch)
+            if files:
+                prog, info = files, (info if info.get('title') else (yi or {}))
+        except Exception as e:
+            notes.append('yt-dlp: ' + re.sub(r'\s+', ' ', str(e))[:120])
+
+    if not prog and not hls_v:
         joined = ' | '.join(notes)
-        if re.search(r'private|password|log ?in|http (?:401|403)|embed|privacy|domain', joined, re.I):
+        if re.search(r'http (?:401|403)|password|private|privacy|domain', joined, re.I) and not cfg_ok:
             msg = 'This Vimeo video is private, password-protected or limited to certain websites, so it cannot be downloaded.'
         elif re.search(r'http 404|not found|does not exist|removed', joined, re.I):
             msg = 'This Vimeo video was not found. It may have been deleted.'
         else:
-            msg = 'Could not get this Vimeo video. It may be private, or Vimeo may be blocking the request.'
+            msg = 'Could not get a downloadable file for this Vimeo video. It may be private, or Vimeo may be blocking the request.'
         return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
 
     oe = vimeo_oembed(watch) if not info.get('title') or not info.get('thumbnail') else {}
@@ -1292,9 +1373,14 @@ def extract_vimeo(raw_url, mode='video'):
     thumb = info.get('thumbnail') or oe.get('thumbnail_url') or ''
     duration = info.get('duration') or oe.get('duration')
 
-    qualities = [{'label': (f'{hh}p' if hh else 'Video'), 'url': u} for hh, u in files]
-    smallest = files[-1][1]          # smallest file = fastest source for the MP3
-    res = _fb_result([{'url': files[0][1], 'type': 'video'}], title[:150], thumb, qualities, smallest, duration)
+    if prog:
+        qualities = [{'label': (f'{hh}p' if hh else 'Video'), 'url': u} for hh, u in prog]
+        res = _fb_result([{'url': prog[0][1], 'type': 'video'}], title[:150], thumb, qualities, prog[-1][1], duration)
+    else:
+        qualities = [{'label': f'{hh}p', 'vm': vimeo_token(u, hls_a)} for hh, u in hls_v]
+        res = _fb_result([], title[:150], thumb, qualities, None, duration)
+        res['is_image'] = False
+        res['audio_vm'] = vimeo_token(hls_a or hls_v[-1][1], None)
     res['video_id'] = vid
     res['embed_url'] = vimeo_embed_url(vid, h)
     return res
@@ -1342,7 +1428,66 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(payload).encode('utf-8'))
 
+    def _vimeo_stream_download(self, query_params):
+        """Joins Vimeo's streaming pieces into one MP4 (or an MP3) with ffmpeg, then sends it."""
+        try:
+            v, a = vimeo_untoken(query_params.get('vm', [''])[0])
+        except Exception:
+            return self._json(400, {'error': 'Invalid download link'})
+        exe = ffmpeg_path()
+        if not exe:
+            return self._json(500, {'error': 'Video tools are not available on the server.'})
+        filename = query_params.get('filename', ['vimeo-video'])[0].replace('"', '')
+        want_mp3 = query_params.get('mp3', ['0'])[0] == '1'
+        try:
+            br = int(query_params.get('br', ['128'])[0])
+        except ValueError:
+            br = 128
+        br = br if 32 <= br <= 128 else 128
+        hdr = 'Referer: https://vimeo.com/\r\nUser-Agent: ' + UA + '\r\n'
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                if want_mp3:
+                    out = os.path.join(tmp, 'out.mp3')
+                    cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', a or v, '-vn',
+                           '-codec:a', 'libmp3lame', '-b:a', f'{br}k', out]
+                    ctype = 'audio/mpeg'
+                    filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp3'
+                else:
+                    out = os.path.join(tmp, 'out.mp4')
+                    cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', v]
+                    if a:
+                        cmd += ['-headers', hdr, '-i', a]
+                    cmd += ['-map', '0:v:0'] + (['-map', '1:a:0'] if a else []) + ['-c', 'copy', '-movflags', '+faststart', out]
+                    ctype = 'video/mp4'
+                    filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp4'
+                proc = subprocess.run(cmd, capture_output=True, timeout=55)
+                if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+                    err = re.sub(r'\s+', ' ', proc.stderr.decode('utf-8', errors='ignore'))[:200]
+                    return self._json(502, {'error': 'Could not prepare the file. ' + err})
+                size = os.path.getsize(out)
+                self.send_response(200)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                self.send_header('Content-Length', str(size))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                with open(out, 'rb') as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except subprocess.TimeoutExpired:
+            return self._json(504, {'error': 'The video took too long to prepare. Try a lower quality.'})
+        except Exception as e:
+            return self._json(500, {'error': str(e)})
+
     def do_GET(self):
+        if 'vm=' in self.path and '?url=' not in self.path:
+            return self._vimeo_stream_download(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
         if '?url=' in self.path:
             target_url = None
             req_headers = {}
