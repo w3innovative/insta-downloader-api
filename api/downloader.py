@@ -37,6 +37,7 @@ ALLOWED_PROXY_SUFFIXES = (
     'gcs-vimeo.akamaized.net',
     'vod-adaptive.akamaized.net',
     'sndcdn.com',
+    'soundcloud.cloud',
 )
 
 
