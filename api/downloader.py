@@ -1269,6 +1269,9 @@ def vimeo_hls_from_cfg(cfg):
     with urllib.request.urlopen(req, timeout=20) as r:
         text = r.read().decode('utf-8', errors='ignore')
 
+    if 'skd://' in text or '/drm/' in master:
+        return [], None        # Apple-only encrypted playlist: ffmpeg cannot open it
+
     audio_groups = {}
     for line in text.splitlines():
         if line.startswith('#EXT-X-MEDIA') and 'TYPE=AUDIO' in line:
@@ -1297,19 +1300,76 @@ def vimeo_hls_from_cfg(cfg):
     return out, audio
 
 
-def vimeo_token(video_url, audio_url):
-    raw = json.dumps({'v': video_url, 'a': audio_url}, separators=(',', ':')).encode('utf-8')
+def vimeo_token(video_url=None, audio_url=None, dash_url=None, height=None):
+    raw = json.dumps({'v': video_url, 'a': audio_url, 'd': dash_url, 'q': height}, separators=(',', ':')).encode('utf-8')
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
 def vimeo_untoken(tok):
     d = json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4)))
-    v, a = d.get('v'), d.get('a')
-    if v and not host_allowed(v):
-        raise ValueError('disallowed host')
-    if a and not host_allowed(a):
-        raise ValueError('disallowed host')
-    return v, a
+    for key in ('v', 'a', 'd'):
+        if d.get(key) and not host_allowed(d[key]):
+            raise ValueError('disallowed host')
+    return d
+
+
+def _vimeo_get(url, tries=3):
+    last = None
+    for _ in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': UA, 'Referer': 'https://vimeo.com/',
+                                                       'Origin': 'https://vimeo.com'})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+    raise last
+
+
+def vimeo_dash_playlist(cfg):
+    """DASH manifest of the video (playlist.json): clear segments listed one by one. Returns (url, json) or (None, None)."""
+    dash = ((cfg.get('request') or {}).get('files') or {}).get('dash') or {}
+    cdns = dash.get('cdns') or {}
+    urls = []
+    if dash.get('default_cdn') in cdns and cdns[dash['default_cdn']].get('url'):
+        urls.append(cdns[dash['default_cdn']]['url'])
+    urls += [c['url'] for c in cdns.values() if c.get('url') and c['url'] not in urls]
+    for u in urls:
+        try:
+            return u, json.loads(_vimeo_get(u).decode('utf-8', errors='ignore'))
+        except Exception:
+            continue
+    return None, None
+
+
+def vimeo_dash_heights(pl):
+    """{height: best H.264 stream} from a DASH playlist.json."""
+    best = {}
+    for st in pl.get('video') or []:
+        codecs = str(st.get('codecs') or '')
+        if re.search(r'hvc1|hev1|av01|vp09|vp9', codecs):
+            continue
+        h = int(st.get('height') or 0)
+        if h and (h not in best or (st.get('bitrate') or 0) > (best[h].get('bitrate') or 0)):
+            best[h] = st
+    return best
+
+
+def vimeo_dash_stream_file(playlist_url, pl, st, path):
+    """Writes one DASH stream (init segment + all media segments) to a fragmented MP4 file."""
+    base = urllib.parse.urljoin(playlist_url, pl.get('base_url') or '')
+    sbase = urllib.parse.urljoin(base, st.get('base_url') or '')
+    init = base64.b64decode(st.get('init_segment') or '')
+    if b'tenc' in init or b'encv' in init or b'enca' in init:
+        raise RuntimeError('drm-protected stream')
+    urls = [urllib.parse.urljoin(sbase, seg.get('url') or '') for seg in st.get('segments') or []]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        parts = list(ex.map(_vimeo_get, urls))
+    with open(path, 'wb') as f:
+        f.write(init)
+        for part in parts:
+            f.write(part)
 
 
 def vimeo_oembed(watch_url):
@@ -1330,6 +1390,7 @@ def extract_vimeo(raw_url, mode='video'):
 
     notes, info, cfg_ok = [], {}, False
     prog, hls_v, hls_a = [], [], None
+    dash_url, dash_streams = None, {}
 
     # 1) Vimeo's player data: ready-made MP4 files, or streaming playlists
     try:
@@ -1339,10 +1400,23 @@ def extract_vimeo(raw_url, mode='video'):
         prog = vimeo_progressive_from_cfg(cfg)
         if not prog:
             try:
-                hls_v, hls_a = vimeo_hls_from_cfg(cfg)
+                dash_url, pl = vimeo_dash_playlist(cfg)
+                if pl:
+                    dash_streams = vimeo_dash_heights(pl)
+                    if not dash_streams:
+                        notes.append('dash: no h264 streams')
+                else:
+                    notes.append('dash: not available')
             except Exception as e:
-                notes.append('hls: ' + re.sub(r'\s+', ' ', str(e))[:100])
-            if not hls_v:
+                notes.append('dash: ' + re.sub(r'\s+', ' ', str(e))[:100])
+            if not dash_streams:
+                try:
+                    hls_v, hls_a = vimeo_hls_from_cfg(cfg)
+                    if not hls_v:
+                        notes.append('hls: encrypted or empty')
+                except Exception as e:
+                    notes.append('hls: ' + re.sub(r'\s+', ' ', str(e))[:100])
+            if not dash_streams and not hls_v:
                 notes.append('player: no downloadable streams')
     except urllib.error.HTTPError as e:
         notes.append(f'player: http {e.code}')
@@ -1350,7 +1424,7 @@ def extract_vimeo(raw_url, mode='video'):
         notes.append('player: ' + re.sub(r'\s+', ' ', str(e))[:100])
 
     # 2) yt-dlp as a backup
-    if not prog and not hls_v:
+    if not prog and not hls_v and not dash_streams:
         try:
             files, yi = vimeo_via_ytdlp(watch)
             if files:
@@ -1358,7 +1432,7 @@ def extract_vimeo(raw_url, mode='video'):
         except Exception as e:
             notes.append('yt-dlp: ' + re.sub(r'\s+', ' ', str(e))[:120])
 
-    if not prog and not hls_v:
+    if not prog and not hls_v and not dash_streams:
         joined = ' | '.join(notes)
         if re.search(r'http (?:401|403)|password|private|privacy|domain', joined, re.I) and not cfg_ok:
             msg = 'This Vimeo video is private, password-protected or limited to certain websites, so it cannot be downloaded.'
@@ -1376,6 +1450,12 @@ def extract_vimeo(raw_url, mode='video'):
     if prog:
         qualities = [{'label': (f'{hh}p' if hh else 'Video'), 'url': u} for hh, u in prog]
         res = _fb_result([{'url': prog[0][1], 'type': 'video'}], title[:150], thumb, qualities, prog[-1][1], duration)
+    elif dash_streams:
+        heights = sorted(dash_streams, reverse=True)
+        qualities = [{'label': f'{hh}p', 'vm': vimeo_token(dash_url=dash_url, height=hh)} for hh in heights]
+        res = _fb_result([], title[:150], thumb, qualities, None, duration)
+        res['is_image'] = False
+        res['audio_vm'] = vimeo_token(dash_url=dash_url, height=-1)      # -1 = sound only
     else:
         qualities = [{'label': f'{hh}p', 'vm': vimeo_token(u, hls_a)} for hh, u in hls_v]
         res = _fb_result([], title[:150], thumb, qualities, None, duration)
@@ -1441,9 +1521,9 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(payload).encode('utf-8'))
 
     def _vimeo_stream_download(self, query_params):
-        """Joins Vimeo's streaming pieces into one MP4 (or an MP3) with ffmpeg, then sends it."""
+        """Joins Vimeo's pieces (DASH segments or streaming playlists) into one MP4 / MP3 with ffmpeg."""
         try:
-            v, a = vimeo_untoken(query_params.get('vm', [''])[0])
+            tok = vimeo_untoken(query_params.get('vm', [''])[0])
         except Exception:
             return self._json(400, {'error': 'Invalid download link'})
         exe = ffmpeg_path()
@@ -1460,23 +1540,47 @@ class handler(BaseHTTPRequestHandler):
         hdr = 'Referer: https://vimeo.com/\r\nUser-Agent: ' + UA + '\r\n'
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                v_in, a_in, net = tok.get('v'), tok.get('a'), True
+                if tok.get('d'):
+                    # DASH: download the segments ourselves, ffmpeg only joins the two files
+                    net = False
+                    dash_url = tok['d']
+                    pl = json.loads(_vimeo_get(dash_url).decode('utf-8', errors='ignore'))
+                    v_in = a_in = None
+                    audio_streams = [x for x in (pl.get('audio') or []) if x.get('segments')]
+                    audio_streams.sort(key=lambda x: (('mp4a' in str(x.get('codecs'))), x.get('bitrate') or 0), reverse=True)
+                    if audio_streams:
+                        a_in = os.path.join(tmp, 'a.mp4')
+                        vimeo_dash_stream_file(dash_url, pl, audio_streams[0], a_in)
+                    if tok.get('q') != -1:
+                        streams = vimeo_dash_heights(pl)
+                        if not streams:
+                            return self._json(502, {'error': 'No playable video stream was found.'})
+                        h = tok.get('q') if tok.get('q') in streams else max(streams)
+                        v_in = os.path.join(tmp, 'v.mp4')
+                        vimeo_dash_stream_file(dash_url, pl, streams[h], v_in)
+                    if want_mp3 and not a_in:
+                        return self._json(502, {'error': 'This video has no audio track.'})
+
+                def src(path):
+                    return ['-headers', hdr, '-i', path] if net else ['-i', path]
+
                 if want_mp3:
                     out = os.path.join(tmp, 'out.mp3')
-                    cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', a or v, '-vn',
-                           '-codec:a', 'libmp3lame', '-b:a', f'{br}k', out]
+                    cmd = [exe, '-v', 'error', '-y'] + src(a_in or v_in) + ['-vn', '-codec:a', 'libmp3lame', '-b:a', f'{br}k', out]
                     ctype = 'audio/mpeg'
                     filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp3'
                 else:
                     out = os.path.join(tmp, 'out.mp4')
-                    cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', v]
-                    if a:
-                        cmd += ['-headers', hdr, '-i', a]
-                    cmd += ['-map', '0:v:0'] + (['-map', '1:a:0'] if a else []) + ['-c', 'copy', '-movflags', '+faststart', out]
+                    cmd = [exe, '-v', 'error', '-y'] + src(v_in) + (src(a_in) if a_in else [])
+                    cmd += ['-map', '0:v:0'] + (['-map', '1:a:0'] if a_in else []) + ['-c', 'copy', '-movflags', '+faststart', out]
                     ctype = 'video/mp4'
                     filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp4'
                 proc = subprocess.run(cmd, capture_output=True, timeout=55)
                 if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
                     err = re.sub(r'\s+', ' ', proc.stderr.decode('utf-8', errors='ignore'))[:200]
+                    if 'skd://' in err or 'key file' in err:
+                        return self._json(502, {'error': 'This Vimeo video is protected (DRM), so it cannot be downloaded.'})
                     return self._json(502, {'error': 'Could not prepare the file. ' + err})
                 size = os.path.getsize(out)
                 self.send_response(200)
@@ -1495,6 +1599,10 @@ class handler(BaseHTTPRequestHandler):
             return
         except subprocess.TimeoutExpired:
             return self._json(504, {'error': 'The video took too long to prepare. Try a lower quality.'})
+        except RuntimeError as e:
+            if 'drm' in str(e):
+                return self._json(502, {'error': 'This Vimeo video is protected (DRM), so it cannot be downloaded.'})
+            return self._json(500, {'error': str(e)})
         except Exception as e:
             return self._json(500, {'error': str(e)})
 
