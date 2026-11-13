@@ -36,6 +36,7 @@ ALLOWED_PROXY_SUFFIXES = (
     'vod-progressive.akamaized.net',
     'gcs-vimeo.akamaized.net',
     'vod-adaptive.akamaized.net',
+    'sndcdn.com',
 )
 
 
@@ -1561,6 +1562,117 @@ def extract_vimeo(raw_url, mode='video'):
     return res
 
 
+# ---------------------------------------------------------------------------
+# SoundCloud
+# yt-dlp reads public tracks. A ready-made MP3 file is used when SoundCloud offers one, otherwise the
+# streaming version is converted to MP3 with ffmpeg when the download button is clicked.
+# ---------------------------------------------------------------------------
+def is_soundcloud_url(raw_url):
+    try:
+        p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+        host = (p.hostname or '').lower()
+    except Exception:
+        return False
+    return host in ('soundcloud.com', 'snd.sc') or host.endswith('.soundcloud.com')
+
+
+def resolve_sc_url(url):
+    p = urllib.parse.urlparse(url if '://' in url else 'https://' + url)
+    host = (p.hostname or '').lower()
+    if host in ('on.soundcloud.com', 'snd.sc'):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': UA})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                url = r.geturl()
+        except Exception:
+            return url
+    q = urllib.parse.urlparse(url)
+    return urllib.parse.urlunparse((q.scheme or 'https', q.netloc, q.path, '', '', ''))   # drop tracking parameters
+
+
+def sc_token(url, copy):
+    raw = json.dumps({'v': url, 'c': bool(copy)}, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def sc_untoken(tok):
+    d = json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4)))
+    if not d.get('v') or not host_allowed(d['v']):
+        raise ValueError('disallowed host')
+    return d['v'], bool(d.get('c'))
+
+
+def sc_pick_audio(info):
+    """('file', url) for a ready-made MP3, ('stream', token) for streaming versions, or (None, None)."""
+    formats = [f for f in (info.get('formats') or []) if f.get('url') and f.get('acodec') != 'none']
+    prog = [f for f in formats if str(f.get('protocol')) in ('https', 'http') and f.get('ext') == 'mp3']
+    if prog:
+        prog.sort(key=lambda f: f.get('abr') or f.get('tbr') or 0, reverse=True)
+        return 'file', prog[0]['url']
+    hls = [f for f in formats if 'm3u8' in str(f.get('protocol'))]
+    hls_mp3 = [f for f in hls if 'mp3' in str(f.get('format_id')) or f.get('acodec') in ('mp3', 'mp3a')]
+    if hls_mp3:
+        hls_mp3.sort(key=lambda f: f.get('abr') or f.get('tbr') or 0, reverse=True)
+        return 'stream', sc_token(hls_mp3[0]['url'], True)
+    if hls:
+        hls.sort(key=lambda f: f.get('abr') or f.get('tbr') or 0, reverse=True)
+        return 'stream', sc_token(hls[0]['url'], False)
+    return None, None
+
+
+def sc_cover(info):
+    best, best_w = info.get('thumbnail') or '', 0
+    for t in info.get('thumbnails') or []:
+        u = t.get('url') or ''
+        if not u:
+            continue
+        w = int(t.get('width') or 0)
+        if str(t.get('id')) == 'original':
+            return u
+        if w > best_w:
+            best, best_w = u, w
+    return best
+
+
+def extract_soundcloud(raw_url, mode='mp3'):
+    url = resolve_sc_url(raw_url.strip())
+    if not re.match(r'https?://[^/]+/[^/]+/[^/]+', url) or '/sets/' in url:
+        return {'error': 'Please paste the link of a single SoundCloud track (soundcloud.com/artist/track). '
+                         'Playlists and albums are not supported.'}
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True, 'noplaylist': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        msg = re.sub(r'\s+', ' ', str(e))
+        if re.search(r'404|not found|does not exist|private|403|forbidden', msg, re.I):
+            human = 'This SoundCloud track was not found or is private, so it cannot be downloaded.'
+        else:
+            human = 'Could not read this SoundCloud track. It may be private, or SoundCloud may be blocking the request.'
+        return {'error': human + ' [DEBUG: ' + msg[:300] + ']'}
+    if not info or info.get('_type') == 'playlist' or info.get('entries'):
+        return {'error': 'Please paste the link of a single SoundCloud track. Playlists and albums are not supported.'}
+
+    kind, audio = sc_pick_audio(info)
+    if not kind:
+        return {'error': 'No downloadable audio was found for this track. It may be limited to SoundCloud Go+ listeners.'}
+
+    title = (info.get('track') or info.get('title') or '').strip()
+    artist = (info.get('artist') or info.get('uploader') or '').strip()
+    res = {
+        'items': [], 'download_urls': [], 'is_image': False,
+        'title': title[:150], 'artist': artist[:80], 'duration': info.get('duration'),
+        'thumbnail': sc_cover(info), 'cover_url': sc_cover(info),
+        'embed_url': 'https://w.soundcloud.com/player/?url=' + urllib.parse.quote(url, safe='')
+                     + '&color=%23ff5500&auto_play=false&hide_related=true&show_comments=false&show_user=true&show_reposts=false&visual=false',
+        'qualities': [{'label': 'MP3'}],
+    }
+    if kind == 'file':
+        res['audio_url'] = audio
+    else:
+        res['audio_sc'] = audio
+    return res
+
+
 FFMPEG_NOTE = ''
 
 
@@ -1741,7 +1853,50 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {'error': str(e)})
 
+    def _soundcloud_stream_download(self, query_params):
+        """SoundCloud streaming version -> one MP3 file (ffmpeg joins the pieces)."""
+        try:
+            src_url, copy = sc_untoken(query_params.get('sc', [''])[0])
+        except Exception:
+            return self._json(400, {'error': 'Invalid download link'})
+        exe = ffmpeg_path()
+        if not exe:
+            return self._json(500, {'error': 'Audio tools are not available on the server. '
+                                             'Check that imageio-ffmpeg is listed in requirements.txt. [DEBUG: ' + FFMPEG_NOTE + ']'})
+        filename = query_params.get('filename', ['soundcloud-track'])[0].replace('"', '')
+        filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp3'
+        hdr = 'User-Agent: ' + UA + '\r\n'
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, 'out.mp3')
+                codec = ['-c:a', 'copy'] if copy else ['-c:a', 'libmp3lame', '-b:a', '128k']
+                proc = subprocess.run([exe, '-v', 'error', '-y', '-headers', hdr, '-i', src_url, '-vn'] + codec + [out],
+                                      capture_output=True, timeout=55)
+                if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+                    err = re.sub(r'\s+', ' ', proc.stderr.decode('utf-8', errors='ignore'))[:200]
+                    return self._json(502, {'error': 'Could not prepare the MP3. ' + err})
+                self.send_response(200)
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                self.send_header('Content-Length', str(os.path.getsize(out)))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                with open(out, 'rb') as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except subprocess.TimeoutExpired:
+            return self._json(504, {'error': 'The track took too long to prepare. Please try again.'})
+        except Exception as e:
+            return self._json(500, {'error': str(e)})
+
     def do_GET(self):
+        if 'sc=' in self.path and '?url=' not in self.path and 'vm=' not in self.path:
+            return self._soundcloud_stream_download(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
         if 'vm=' in self.path and '?url=' not in self.path:
             return self._vimeo_stream_download(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
         if '?url=' in self.path:
@@ -1857,6 +2012,13 @@ class handler(BaseHTTPRequestHandler):
             # ---- Vimeo Route ----
             if is_vimeo_url(raw_url):
                 result = extract_vimeo(raw_url, str(data.get('mode') or 'video'))
+                if 'error' in result:
+                    return self._json(500, {'error': result['error']})
+                return self._json(200, result)
+
+            # ---- SoundCloud Route ----
+            if is_soundcloud_url(raw_url):
+                result = extract_soundcloud(raw_url, str(data.get('mode') or 'mp3'))
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
