@@ -1379,10 +1379,10 @@ def vimeo_parse_mpd(text):
     root = ET.fromstring(text)
     def local(tag):
         return tag.rsplit('}', 1)[-1]
-    vids, has_audio, drm, idx = [], False, False, 0
+    vids, has_audio, drm, idx = [], False, [], 0
     for el in root.iter():
         if local(el.tag) == 'ContentProtection':
-            drm = True
+            drm.append((el.get('schemeIdUri') or '').lower())
     for aset in root.iter():
         if local(aset.tag) != 'AdaptationSet':
             continue
@@ -1407,13 +1407,26 @@ def vimeo_load_dash(url):
     if head == '{':
         return json.loads(text), ''
     if head == '<':
-        vids, has_audio, drm = vimeo_parse_mpd(text)
-        if drm:
-            return None, 'encrypted (DRM)'
+        vids, has_audio, schemes = vimeo_parse_mpd(text)
+        names = {'edef8ba9': 'widevine', '9a04f079': 'playready', '94ce86fb': 'fairplay', '1077efec': 'marlin',
+                 'e2719d58': 'playready', '3d5e6d35': 'playready', '1077efec': 'marlin'}
+        found = sorted({n for sch in schemes for k, n in names.items() if k in sch})
+        if found:
+            return None, 'encrypted (DRM: ' + ','.join(found) + ')'
         if not vids:
             return None, 'mpd without video'
-        return {'mpd': True, 'vids': vids, 'audio': has_audio}, ''
+        return {'mpd': True, 'vids': vids, 'audio': has_audio, 'schemes': schemes}, ''
     return None, 'unexpected reply: ' + repr(text[:50])
+
+
+def vimeo_output_encrypted(path):
+    """True when the finished MP4 still has encrypted samples (it would not play)."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(2_000_000)
+        return b'tenc' in head or b'encv' in head or b'enca' in head
+    except Exception:
+        return False
 
 
 def vimeo_dash_heights(pl):
@@ -1513,7 +1526,7 @@ def extract_vimeo(raw_url, mode='video'):
 
     if not prog and not hls_v and not dash_streams:
         joined = ' | '.join(notes)
-        if 'encrypted (DRM)' in joined:
+        if 'encrypted (DRM' in joined:
             msg = ('This Vimeo video uses copy protection (DRM), so it cannot be downloaded. '
                    'Only videos without protection can be saved.')
         elif re.search(r'http (?:401|403)|password|private|privacy|domain', joined, re.I) and not cfg_ok:
@@ -1522,7 +1535,7 @@ def extract_vimeo(raw_url, mode='video'):
             msg = 'This Vimeo video was not found. It may have been deleted.'
         else:
             msg = 'Could not get a downloadable file for this Vimeo video. It may be private, or Vimeo may be blocking the request.'
-        return {'error': msg + ' [DEBUG: ' + joined[:400] + ']'}
+        return {'error': msg + ' [DEBUG: vimeo-r5 | ' + joined[:420] + ']'}
 
     oe = vimeo_oembed(watch) if not info.get('title') or not info.get('thumbnail') else {}
     title = (info.get('title') or oe.get('title') or '').strip()
@@ -1651,6 +1664,8 @@ class handler(BaseHTTPRequestHandler):
                         if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
                             err = re.sub(r'\s+', ' ', proc.stderr.decode('utf-8', errors='ignore'))[:200]
                             return self._json(502, {'error': 'Could not prepare the file. ' + err})
+                        if not want_mp3 and vimeo_output_encrypted(out):
+                            return self._json(502, {'error': 'This Vimeo video is protected (DRM), so it cannot be downloaded.'})
                         self.send_response(200)
                         self.send_header('Content-Type', ctype)
                         self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
@@ -1697,6 +1712,8 @@ class handler(BaseHTTPRequestHandler):
                 proc = subprocess.run(cmd, capture_output=True, timeout=55)
                 if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
                     err = re.sub(r'\s+', ' ', proc.stderr.decode('utf-8', errors='ignore'))[:200]
+                    if not want_mp3 and os.path.exists(out) and vimeo_output_encrypted(out):
+                        return self._json(502, {'error': 'This Vimeo video is protected (DRM), so it cannot be downloaded.'})
                     if 'skd://' in err or 'key file' in err:
                         return self._json(502, {'error': 'This Vimeo video is protected (DRM), so it cannot be downloaded.'})
                     return self._json(502, {'error': 'Could not prepare the file. ' + err})
