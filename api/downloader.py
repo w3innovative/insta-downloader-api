@@ -1729,6 +1729,33 @@ def dm_metadata(vid):
         return None, 'metadata: bad json'
 
 
+def dm_fetch_playlist(url, vid):
+    """Loads a Dailymotion streaming playlist the way the website player does (Referer/Origin headers).
+    Tries a few header sets. Returns (status, final_url, text); status of the last try when all fail."""
+    sets = [
+        {'User-Agent': UA, 'Referer': 'https://www.dailymotion.com/', 'Origin': 'https://www.dailymotion.com'},
+        {'User-Agent': UA, 'Referer': f'https://www.dailymotion.com/embed/video/{vid}',
+         'Origin': 'https://www.dailymotion.com'},
+        {'User-Agent': UA, 'Referer': 'https://geo.dailymotion.com/', 'Origin': 'https://geo.dailymotion.com'},
+        {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 '
+                       '(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'},
+    ]
+    status, final, text = 0, url, ''
+    for h in sets:
+        h = dict(h, **{'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9'})
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=20) as r:
+                body = r.read().decode('utf-8', errors='ignore')
+                if '#EXTM3U' in body:
+                    return r.status, r.geturl(), body
+                status, final, text = r.status, r.geturl(), body
+        except urllib.error.HTTPError as e:
+            status = e.code
+        except Exception:
+            status = 0
+    return status, final, text
+
+
 def extract_dailymotion(raw_url, mode='video'):
     url = raw_url.strip()
     vid = dm_video_id(url)
@@ -1778,9 +1805,12 @@ def extract_dailymotion(raw_url, mode='video'):
         qualities = [{'label': f'{h}p', 'url': u} for h, u in progressive]
     elif master:
         try:
-            status, final, text = fb_fetch(master, UA)
+            status, final, text = dm_fetch_playlist(master, vid)
             if status != 200 or '#EXTM3U' not in text:
                 notes.append(f'playlist: http={status}')
+                # Could not read the list of qualities: let ffmpeg open the master itself and pick the best one.
+                qualities = [{'label': 'Best quality', 'dm': hls_token(master, None)}]
+                audio_token = hls_token(master, None)
             else:
                 variants, audio = _vimeo_parse_hls_master(final or master, text)
                 if not variants:
@@ -2175,7 +2205,7 @@ class handler(BaseHTTPRequestHandler):
         except ValueError:
             br = 128
         br = br if 32 <= br <= 128 else 128
-        hdr = 'User-Agent: ' + UA + '\r\nReferer: ' + referer + '\r\n'
+        hdr = 'User-Agent: ' + UA + '\r\nReferer: ' + referer + '\r\nOrigin: ' + referer.rstrip('/') + '\r\n'
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 if want_mp3:
