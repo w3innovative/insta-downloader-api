@@ -40,6 +40,7 @@ ALLOWED_PROXY_SUFFIXES = (
     'soundcloud.cloud',
     'dailymotion.com',
     'dmcdn.net',
+    'twitch.tv',
 )
 
 
@@ -1805,6 +1806,137 @@ def extract_dailymotion(raw_url, mode='video'):
     return res
 
 
+# ---------------------------------------------------------------------------
+# Twitch (clips only)
+# Clip files come from Twitch's public GraphQL service, the same one the Twitch website uses.
+# A clip is one ready-made MP4 file per quality, so no joining is needed. VODs and live streams are not supported.
+# ---------------------------------------------------------------------------
+TW_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko'
+
+
+def is_twitch_url(raw_url):
+    try:
+        p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+        host = (p.hostname or '').lower()
+    except Exception:
+        return False
+    return host == 'twitch.tv' or host.endswith('.twitch.tv')
+
+
+def tw_clip_slug(raw_url):
+    """Clip slug from clips.twitch.tv/SLUG, twitch.tv/USER/clip/SLUG, m.twitch.tv/clip/SLUG or an embed link."""
+    p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
+    q = urllib.parse.parse_qs(p.query)
+    if (q.get('clip') or [''])[0]:
+        return q['clip'][0]
+    host = (p.hostname or '').lower()
+    parts = [x for x in p.path.split('/') if x]
+    if host == 'clips.twitch.tv' and parts and parts[0] != 'embed':
+        return parts[0]
+    if 'clip' in parts and parts.index('clip') + 1 < len(parts):
+        return parts[parts.index('clip') + 1]
+    return None
+
+
+def tw_gql(payload):
+    req = urllib.request.Request(
+        'https://gql.twitch.tv/gql', data=json.dumps(payload).encode('utf-8'),
+        headers={'Client-ID': TW_CLIENT_ID, 'Content-Type': 'application/json', 'User-Agent': UA,
+                 'Accept': 'application/json'}, method='POST')
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode('utf-8', errors='ignore'))
+
+
+def tw_get_clip(slug):
+    """Clip data from Twitch GraphQL. Returns (clip_dict or None, notes)."""
+    notes = []
+    safe = re.sub(r'[^A-Za-z0-9_-]', '', slug)
+    query = ('query { clip(slug: "%s") { title durationSeconds thumbnailURL viewCount '
+             'broadcaster { displayName } game { name } '
+             'playbackAccessToken(params: {platform: "web", playerBackend: "mediaplayer", playerType: "site"}) '
+             '{ signature value } videoQualities { frameRate quality sourceURL } } }' % safe)
+    attempts = [
+        ('query', {'query': query}),
+        ('persisted', {'operationName': 'VideoAccessToken_Clip', 'variables': {'slug': safe},
+                       'extensions': {'persistedQuery': {'version': 1, 'sha256Hash':
+                                      '36b89d2507fce29e5ca551df756d27c1cfe079e2609642b4390aa4c35796eb11'}}}),
+    ]
+    for label, payload in attempts:
+        try:
+            data = tw_gql(payload)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            clip = ((data.get('data') or {}).get('clip'))
+            if clip and (clip.get('videoQualities') or []):
+                if label == 'persisted':
+                    clip.setdefault('title', '')
+                return clip, notes
+            if data.get('errors'):
+                notes.append(f"{label}: " + re.sub(r'\s+', ' ', str((data['errors'][0] or {}).get('message')))[:80])
+            else:
+                notes.append(f'{label}: clip empty')
+        except urllib.error.HTTPError as e:
+            notes.append(f'{label}: http={e.code}')
+        except Exception as e:
+            notes.append(f'{label}: ' + re.sub(r'\s+', ' ', str(e))[:80])
+    return None, notes
+
+
+def tw_signed(url, token):
+    """Clip file addresses only work together with the access token."""
+    if not token or not token.get('signature'):
+        return url
+    sep = '&' if '?' in url else '?'
+    return f"{url}{sep}sig={token['signature']}&token={urllib.parse.quote(token.get('value') or '', safe='')}"
+
+
+def extract_twitch(raw_url, mode='video'):
+    url = raw_url.strip()
+    low = url.lower()
+    if '/videos/' in low or re.search(r'twitch\.tv/videos', low):
+        return {'error': 'Only Twitch clips are supported. Please paste a clip link (clips.twitch.tv/... or '
+                         'twitch.tv/channel/clip/...). Full videos and live streams are not supported.'}
+    slug = tw_clip_slug(url)
+    if not slug:
+        return {'error': 'Could not find a clip in this link. Please paste a Twitch clip link '
+                         '(clips.twitch.tv/... or twitch.tv/channel/clip/...).'}
+    clip, notes = tw_get_clip(slug)
+    if not clip:
+        joined = ' | '.join(notes)
+        if 'clip empty' in joined and 'http=' not in joined:
+            msg = 'This Twitch clip was not found. It may have been deleted.'
+        else:
+            msg = 'Could not read this Twitch clip. It may have been deleted, or Twitch may be blocking the request.'
+        return {'error': msg + ' [DEBUG: ' + joined[:300] + ']'}
+
+    token = clip.get('playbackAccessToken') or {}
+    files = []
+    for vq in clip.get('videoQualities') or []:
+        src = vq.get('sourceURL')
+        if not src:
+            continue
+        try:
+            h = int(float(vq.get('quality') or 0))
+        except ValueError:
+            h = 0
+        fps = int(float(vq.get('frameRate') or 0))
+        label = (f'{h}p' if h else 'Video') + (str(fps) if fps and fps > 30 else '')
+        files.append((h, fps, label, tw_signed(src, token)))
+    files.sort(reverse=True)
+    if not files:
+        return {'error': 'No downloadable file was found for this Twitch clip.'}
+
+    who = ((clip.get('broadcaster') or {}).get('displayName') or '').strip()
+    game = ((clip.get('game') or {}).get('name') or '').strip()
+    title = (clip.get('title') or '').strip()
+    full_title = title + (f' — {who}' if who else '') + (f' ({game})' if game else '')
+    qualities = [{'label': lab, 'url': u} for h, fps, lab, u in files]
+    res = _fb_result([{'url': files[0][3], 'type': 'video'}], full_title[:150], clip.get('thumbnailURL') or '',
+                     qualities, files[-1][3], clip.get('durationSeconds'))
+    res['preview_url'] = files[-1][3]          # smaller file loads faster for the preview
+    return res
+
+
 FFMPEG_NOTE = ''
 
 
@@ -2216,6 +2348,13 @@ class handler(BaseHTTPRequestHandler):
             # ---- Dailymotion Route ----
             if is_dailymotion_url(raw_url):
                 result = extract_dailymotion(raw_url, str(data.get('mode') or 'video'))
+                if 'error' in result:
+                    return self._json(500, {'error': result['error']})
+                return self._json(200, result)
+
+            # ---- Twitch Route ----
+            if is_twitch_url(raw_url):
+                result = extract_twitch(raw_url, str(data.get('mode') or 'video'))
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
