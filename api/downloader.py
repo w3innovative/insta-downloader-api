@@ -2047,7 +2047,8 @@ class handler(BaseHTTPRequestHandler):
                 audio = query_params.get('audio', ['0'])[0] == '1'    # 1 = audio file: fix its type and extension
 
                 if not target_url or not host_allowed(target_url):
-                    return self._json(400, {'error': 'Invalid or disallowed URL'})
+                    bad_host = (urllib.parse.urlparse(target_url or '').hostname or 'none')[:80]
+                    return self._json(400, {'error': 'Invalid or disallowed URL [DEBUG: host=' + bad_host + ']'})
 
                 req_headers = proxy_request_headers(
                     target_url, query_params.get('h', [None])[0], self.headers.get('Range'))
