@@ -38,9 +38,10 @@ ALLOWED_PROXY_SUFFIXES = (
     'vod-adaptive.akamaized.net',
     'sndcdn.com',
     'soundcloud.cloud',
-    'dailymotion.com',
-    'dmcdn.net',
     'twitch.tv',
+    'twitchcdn.net',
+    'ttvnw.net',
+    'jtvnw.net',
 )
 
 
@@ -1678,165 +1679,6 @@ def extract_soundcloud(raw_url, mode='mp3'):
 
 
 # ---------------------------------------------------------------------------
-# Dailymotion
-# Stream list comes from Dailymotion's public player data. Qualities are streaming playlists; the server
-# joins them into one MP4 with ffmpeg when a button is clicked (ready-made MP4 files are used when offered).
-# ---------------------------------------------------------------------------
-def is_dailymotion_url(raw_url):
-    try:
-        p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
-        host = (p.hostname or '').lower()
-    except Exception:
-        return False
-    return host in ('dai.ly', 'dailymotion.com') or host.endswith('.dailymotion.com')
-
-
-def dm_video_id(raw_url):
-    p = urllib.parse.urlparse(raw_url if '://' in raw_url else 'https://' + raw_url)
-    q = urllib.parse.parse_qs(p.query)
-    if (q.get('video') or [''])[0]:
-        return q['video'][0]
-    if (p.hostname or '').lower() == 'dai.ly':
-        m = re.match(r'/([A-Za-z0-9]+)', p.path)
-        return m.group(1) if m else None
-    m = re.search(r'/(?:video|embed/video|player/metadata/video)/([A-Za-z0-9]+)', p.path)
-    return m.group(1) if m else None
-
-
-def hls_token(video_url=None, audio_url=None):
-    raw = json.dumps({'v': video_url, 'a': audio_url}, separators=(',', ':')).encode('utf-8')
-    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
-
-
-def hls_untoken(tok):
-    d = json.loads(base64.urlsafe_b64decode(tok + '=' * (-len(tok) % 4)))
-    for key in ('v', 'a'):
-        if d.get(key) and not host_allowed(d[key]):
-            raise ValueError('disallowed host')
-    if not (d.get('v') or d.get('a')):
-        raise ValueError('empty')
-    return d.get('v'), d.get('a')
-
-
-def dm_metadata(vid):
-    """(metadata_dict or None, note)."""
-    status, final, text = fb_fetch(f'https://www.dailymotion.com/player/metadata/video/{vid}', UA)
-    if status != 200 or not text.lstrip().startswith('{'):
-        return None, f'metadata: http={status}'
-    try:
-        return json.loads(text), ''
-    except Exception:
-        return None, 'metadata: bad json'
-
-
-def dm_fetch_playlist(url, vid):
-    """Loads a Dailymotion streaming playlist the way the website player does (Referer/Origin headers).
-    Tries a few header sets. Returns (status, final_url, text); status of the last try when all fail."""
-    sets = [
-        {'User-Agent': UA, 'Referer': 'https://www.dailymotion.com/', 'Origin': 'https://www.dailymotion.com'},
-        {'User-Agent': UA, 'Referer': f'https://www.dailymotion.com/embed/video/{vid}',
-         'Origin': 'https://www.dailymotion.com'},
-        {'User-Agent': UA, 'Referer': 'https://geo.dailymotion.com/', 'Origin': 'https://geo.dailymotion.com'},
-        {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 '
-                       '(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'},
-    ]
-    status, final, text = 0, url, ''
-    for h in sets:
-        h = dict(h, **{'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9'})
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=20) as r:
-                body = r.read().decode('utf-8', errors='ignore')
-                if '#EXTM3U' in body:
-                    return r.status, r.geturl(), body
-                status, final, text = r.status, r.geturl(), body
-        except urllib.error.HTTPError as e:
-            status = e.code
-        except Exception:
-            status = 0
-    return status, final, text
-
-
-def extract_dailymotion(raw_url, mode='video'):
-    url = raw_url.strip()
-    vid = dm_video_id(url)
-    if not vid:
-        return {'error': 'Could not find a video in this link. Please paste a full Dailymotion video link '
-                         '(dailymotion.com/video/...).'}
-    meta, note = dm_metadata(vid)
-    if not meta:
-        return {'error': 'Could not read this Dailymotion video. It may be private, or Dailymotion may be blocking the '
-                         'request. [DEBUG: ' + note + ']'}
-    err = meta.get('error')
-    if err:
-        text = ((err.get('title') or '') + ' ' + (err.get('message') or '')).strip()
-        kind = str(err.get('type') or '')
-        if 'geo' in kind or 'country' in text.lower():
-            human = 'This Dailymotion video is not available in the country where the server runs.'
-        elif re.search(r'private|password|access|age|explicit|login|sign', kind + ' ' + text, re.I):
-            human = 'This Dailymotion video is private, age-restricted or protected, so it cannot be downloaded.'
-        else:
-            human = 'This Dailymotion video is not available.'
-        return {'error': human + ' [DEBUG: ' + re.sub(r'\s+', ' ', kind + ': ' + text)[:200] + ']'}
-
-    title = (meta.get('title') or '').strip()
-    owner = ((meta.get('owner') or {}).get('screenname') or '').strip()
-    thumb = meta.get('poster_url') or ''
-    if not thumb:
-        posters = meta.get('posters') or {}
-        thumb = posters.get(max(posters, key=lambda k: int(k) if str(k).isdigit() else 0)) if posters else ''
-    duration = meta.get('duration')
-
-    quals = meta.get('qualities') or {}
-    progressive, master = [], None
-    for key, entries in quals.items():
-        for e in entries or []:
-            t, u = str(e.get('type') or ''), e.get('url')
-            if not u:
-                continue
-            if t == 'video/mp4' and str(key).isdigit():
-                progressive.append((int(key), u))
-            elif 'mpegurl' in t.lower() and (key == 'auto' or master is None):
-                master = u
-    progressive.sort(reverse=True)
-
-    qualities, audio_token = [], None
-    notes = []
-    if progressive:
-        qualities = [{'label': f'{h}p', 'url': u} for h, u in progressive]
-    elif master:
-        try:
-            status, final, text = dm_fetch_playlist(master, vid)
-            if status != 200 or '#EXTM3U' not in text:
-                notes.append(f'playlist: http={status}')
-                # Could not read the list of qualities: let ffmpeg open the master itself and pick the best one.
-                qualities = [{'label': 'Best quality', 'dm': hls_token(master, None)}]
-                audio_token = hls_token(master, None)
-            else:
-                variants, audio = _vimeo_parse_hls_master(final or master, text)
-                if not variants:
-                    notes.append('playlist: no h264 variants')
-                qualities = [{'label': f'{h}p', 'dm': hls_token(u, audio)} for h, u in variants]
-                if variants:
-                    audio_token = hls_token(audio, None) if audio else hls_token(variants[-1][1], None)
-        except Exception as e:
-            notes.append('playlist: ' + re.sub(r'\s+', ' ', str(e))[:100])
-    else:
-        notes.append('no streams in player data')
-
-    if not qualities:
-        return {'error': 'No downloadable video file was found for this Dailymotion video. [DEBUG: '
-                         + ' | '.join(notes)[:300] + ']'}
-
-    res = _fb_result([], (title + (f' — {owner}' if owner else ''))[:150], thumb, qualities, None, duration)
-    res['is_image'] = False
-    res['video_id'] = vid
-    res['embed_url'] = f'https://www.dailymotion.com/embed/video/{vid}'
-    if audio_token:
-        res['audio_dm'] = audio_token
-    return res
-
-
-# ---------------------------------------------------------------------------
 # Twitch (clips only)
 # Clip files come from Twitch's public GraphQL service, the same one the Twitch website uses.
 # A clip is one ready-made MP4 file per quality, so no joining is needed. VODs and live streams are not supported.
@@ -2188,65 +2030,7 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {'error': str(e)})
 
-    def _hls_merge_download(self, query_params, key, referer):
-        """Streaming playlists -> one MP4 (or an MP3 of the sound) with ffmpeg. Used by Dailymotion."""
-        try:
-            v, a = hls_untoken(query_params.get(key, [''])[0])
-        except Exception:
-            return self._json(400, {'error': 'Invalid download link'})
-        exe = ffmpeg_path()
-        if not exe:
-            return self._json(500, {'error': 'Video tools are not available on the server. '
-                                             'Check that imageio-ffmpeg is listed in requirements.txt. [DEBUG: ' + FFMPEG_NOTE + ']'})
-        filename = query_params.get('filename', ['video'])[0].replace('"', '')
-        want_mp3 = query_params.get('mp3', ['0'])[0] == '1'
-        try:
-            br = int(query_params.get('br', ['128'])[0])
-        except ValueError:
-            br = 128
-        br = br if 32 <= br <= 128 else 128
-        hdr = 'User-Agent: ' + UA + '\r\nReferer: ' + referer + '\r\nOrigin: ' + referer.rstrip('/') + '\r\n'
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                if want_mp3:
-                    out = os.path.join(tmp, 'out.mp3')
-                    cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', a or v, '-vn', '-codec:a', 'libmp3lame', '-b:a', f'{br}k', out]
-                    ctype = 'audio/mpeg'
-                    filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp3'
-                else:
-                    out = os.path.join(tmp, 'out.mp4')
-                    cmd = [exe, '-v', 'error', '-y', '-headers', hdr, '-i', v]
-                    if a:
-                        cmd += ['-headers', hdr, '-i', a]
-                    cmd += ['-map', '0:v:0'] + (['-map', '1:a:0'] if a else ['-map', '0:a:0?']) + ['-c', 'copy', '-movflags', '+faststart', out]
-                    ctype = 'video/mp4'
-                    filename = re.sub(r'\.[A-Za-z0-9]+$', '', filename) + '.mp4'
-                proc = subprocess.run(cmd, capture_output=True, timeout=55)
-                if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
-                    err = re.sub(r'\s+', ' ', proc.stderr.decode('utf-8', errors='ignore'))[:200]
-                    return self._json(502, {'error': 'Could not prepare the file. ' + err})
-                self.send_response(200)
-                self.send_header('Content-Type', ctype)
-                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-                self.send_header('Content-Length', str(os.path.getsize(out)))
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                with open(out, 'rb') as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            return
-        except subprocess.TimeoutExpired:
-            return self._json(504, {'error': 'The video took too long to prepare. Please try again or pick a lower quality.'})
-        except Exception as e:
-            return self._json(500, {'error': str(e)})
-
     def do_GET(self):
-        if 'dm' in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query):
-            return self._hls_merge_download(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query), 'dm', 'https://www.dailymotion.com/')
         if 'sc=' in self.path and '?url=' not in self.path and 'vm=' not in self.path:
             return self._soundcloud_stream_download(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
         if 'vm=' in self.path and '?url=' not in self.path:
@@ -2371,13 +2155,6 @@ class handler(BaseHTTPRequestHandler):
             # ---- SoundCloud Route ----
             if is_soundcloud_url(raw_url):
                 result = extract_soundcloud(raw_url, str(data.get('mode') or 'mp3'))
-                if 'error' in result:
-                    return self._json(500, {'error': result['error']})
-                return self._json(200, result)
-
-            # ---- Dailymotion Route ----
-            if is_dailymotion_url(raw_url):
-                result = extract_dailymotion(raw_url, str(data.get('mode') or 'video'))
                 if 'error' in result:
                     return self._json(500, {'error': result['error']})
                 return self._json(200, result)
