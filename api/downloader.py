@@ -42,6 +42,7 @@ ALLOWED_PROXY_SUFFIXES = (
     'twitchcdn.net',
     'ttvnw.net',
     'jtvnw.net',
+    'd1ndex63qxojbr.cloudfront.net',   # Twitch clip files (one specific CloudFront address, not all of CloudFront)
 )
 
 
